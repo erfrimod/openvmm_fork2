@@ -722,11 +722,8 @@ impl UhVmNetworkSettings {
                     .await
             },
         ));
-        let run_endpoints = async {
+        let run_endpoints = async move {
             loop {
-                if endpoints.is_empty() {
-                    continue;
-                }
                 let _ = endpoints
                     .iter_mut()
                     .map(|endpoint| endpoint.wait_for_endpoint_action())
@@ -735,10 +732,13 @@ impl UhVmNetworkSettings {
                     .await;
             }
         };
-        // Complete shutdown on the VFs. Process events on the endpoints to
-        // allow for proper shutdown.
-        // Note: race() means that when we exit only one of the two futures is completed and the other gets cancelled.
-        let _ = (shutdown_vfs, run_endpoints).race().await;
+
+        if error.is_some() {
+            shutdown_vfs.await;
+        } else {
+            // Wait for endpoints to close vmbus channels until VF shutdown completes
+            let _ = (shutdown_vfs, run_endpoints).race().await;
+        }
 
         if let Some(e) = error {
             return Err(e);
