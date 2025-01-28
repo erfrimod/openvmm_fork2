@@ -689,8 +689,11 @@ impl UhVmNetworkSettings {
         }
 
         // Close vmbus channels and drop all of the NICs.
-        let mut endpoints: Vec<_> = CancelContext::new()
-            .with_timeout(Duration::from_secs(1))
+        // If vmbus channel shutdown fails, the error is preserved and VF Manager shutdown proceeds.
+        let mut endpoints: Vec<_> = Vec::new();
+        let mut error: Option<anyhow::Error> = None;
+        match CancelContext::new()
+            .with_timeout(Duration::from_millis(1))
             .until_cancelled(join_all(nic_channels.drain(..).map(
                 |(instance_id, channel)| async move {
                     async {
@@ -702,7 +705,14 @@ impl UhVmNetworkSettings {
                 },
             )))
             .await
-            .context("cancelled waiting for vmbus channel close")?;
+            .context("cancelled waiting for vmbus channel close")
+        {
+            Ok(result) => endpoints = result,
+            Err(e) => {
+                tracing::error!("Error closing vmbus channels: {:?}", e);
+                error = Some(e);
+            }
+        };
 
         let shutdown_vfs = join_all(vf_managers.drain(..).map(
             |(instance_id, mut manager)| async move {
@@ -714,6 +724,9 @@ impl UhVmNetworkSettings {
         ));
         let run_endpoints = async {
             loop {
+                if endpoints.is_empty() {
+                    continue;
+                }
                 let _ = endpoints
                     .iter_mut()
                     .map(|endpoint| endpoint.wait_for_endpoint_action())
@@ -724,7 +737,12 @@ impl UhVmNetworkSettings {
         };
         // Complete shutdown on the VFs. Process events on the endpoints to
         // allow for proper shutdown.
+        // Note: race() means that when we exit only one of the two futures is completed and the other gets cancelled.
         let _ = (shutdown_vfs, run_endpoints).race().await;
+
+        if let Some(e) = error {
+            return Err(e);
+        }
 
         Ok(())
     }
