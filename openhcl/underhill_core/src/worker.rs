@@ -647,7 +647,7 @@ impl UhVmNetworkSettings {
         vf_managers: &mut Vec<(Guid, Arc<HclNetworkVFManager>)>,
         remove_vtl0_vf: bool,
         keep_vf_alive: bool,
-    ) {
+    ) -> anyhow::Result<()> {
         // Notify VF managers of shutdown so that the subsequent teardown of
         // the NICs does not modify VF state.
         let mut vf_managers = vf_managers
@@ -689,17 +689,20 @@ impl UhVmNetworkSettings {
         }
 
         // Close vmbus channels and drop all of the NICs.
-        let mut endpoints: Vec<_> = join_all(nic_channels.drain(..).map(
-            |(instance_id, channel)| async move {
-                async {
-                    let nic = channel.remove().await.revoke().await;
-                    nic.shutdown()
-                }
-                .instrument(tracing::info_span!("nic_shutdown", %instance_id))
-                .await
-            },
-        ))
-        .await;
+        let mut endpoints: Vec<_> = CancelContext::new()
+            .with_timeout(Duration::from_secs(1))
+            .until_cancelled(join_all(nic_channels.drain(..).map(
+                |(instance_id, channel)| async move {
+                    async {
+                        let nic = channel.remove().await.revoke().await;
+                        nic.shutdown()
+                    }
+                    .instrument(tracing::info_span!("nic_shutdown", %instance_id))
+                    .await
+                },
+            )))
+            .await
+            .context("cancelled waiting for vmbus channel close")?;
 
         let shutdown_vfs = join_all(vf_managers.drain(..).map(
             |(instance_id, mut manager)| async move {
@@ -722,6 +725,8 @@ impl UhVmNetworkSettings {
         // Complete shutdown on the VFs. Process events on the endpoints to
         // allow for proper shutdown.
         let _ = (shutdown_vfs, run_endpoints).race().await;
+
+        Ok(())
     }
 
     async fn new_underhill_nic(
@@ -916,15 +921,14 @@ impl LoadedVmNetworkSettings for UhVmNetworkSettings {
             .ok_or(NetworkSettingsError::VFManagerMissing(instance_id));
 
         self.shutdown_vf_devices(&mut vec![vf_manager.unwrap()], true, false)
-            .await;
-        Ok(())
+            .await
     }
 
-    async fn unload_for_servicing(&mut self) {
+    async fn unload_for_servicing(&mut self) -> anyhow::Result<()> {
         let mut vf_managers: Vec<(Guid, Arc<HclNetworkVFManager>)> =
             self.vf_managers.drain().collect();
         self.shutdown_vf_devices(&mut vf_managers, false, true)
-            .await;
+            .await
     }
 
     async fn prepare_for_hibernate(&self, rollback: bool) {

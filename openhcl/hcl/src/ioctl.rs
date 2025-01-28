@@ -1922,14 +1922,16 @@ impl<'a, T: Backing> ProcessorRunner<'a, T> {
         // Apply any deferred actions to the run page.
         DEFERRED_ACTIONS.with(|actions| {
             let mut actions = actions.borrow_mut();
-            let actions = actions.as_mut().unwrap();
-            if self.hcl.supports_vtl_ret_action {
-                // SAFETY: there are no concurrent accesses to the deferred action
-                // slots.
-                let mut slots = unsafe { DeferredActionSlots::new(self.run) };
-                actions.copy_to_slots(&mut slots, self.hcl);
-            } else {
-                actions.run_actions(self.hcl);
+            if actions.is_some() {
+                let actions = actions.as_mut().unwrap();
+                if self.hcl.supports_vtl_ret_action {
+                    // SAFETY: there are no concurrent accesses to the deferred action
+                    // slots.
+                    let mut slots = unsafe { DeferredActionSlots::new(self.run) };
+                    actions.copy_to_slots(&mut slots, self.hcl);
+                } else {
+                    actions.run_actions(self.hcl);
+                }
             }
         });
 

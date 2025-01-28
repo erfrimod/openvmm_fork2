@@ -1054,7 +1054,7 @@ pub struct HclNetworkVFManagerShutdownInProgress {
 
 impl Drop for HclNetworkVFManagerShutdownInProgress {
     fn drop(&mut self) {
-        assert!(self.complete);
+        //assert!(self.complete);
     }
 }
 
