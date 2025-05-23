@@ -12,6 +12,7 @@ use gdma_defs::GDMA_EQE_COMPLETION;
 use gdma_defs::Sge;
 use gdma_defs::bnic::CQE_RX_OKAY;
 use gdma_defs::bnic::CQE_TX_GDMA_ERR;
+use gdma_defs::bnic::CQE_TX_INVALID_OOB;
 use gdma_defs::bnic::CQE_TX_OKAY;
 use gdma_defs::bnic::MANA_LONG_PKT_FMT;
 use gdma_defs::bnic::MANA_SHORT_PKT_FMT;
@@ -724,6 +725,13 @@ impl<T: DeviceBacking> ManaQueue<T> {
     }
 
     fn trace_tx_wqe(&mut self, tx_oob: ManaTxCompOob, done_length: usize) {
+        let first_80_bytes = self.tx_wq.read_head(100);
+        let hex_string: String = first_80_bytes
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+
         tracelimit::error_ratelimited!(
             cqe_hdr_type = tx_oob.cqe_hdr.cqe_type(),
             cqe_hdr_vendor_err = tx_oob.cqe_hdr.vendor_err(),
@@ -732,6 +740,7 @@ impl<T: DeviceBacking> ManaQueue<T> {
             tx_oob_wqe_offset = tx_oob.offsets.tx_wqe_offset(),
             done_length,
             posted_tx_len = self.posted_tx.len(),
+            first_bytes = hex_string,
             "tx completion error"
         );
 
@@ -933,7 +942,6 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
 
     fn tx_poll(&mut self, done: &mut [TxId]) -> Result<usize, TxError> {
         let mut i = 0;
-        let mut queue_stuck = false;
         while i < done.len() {
             let id = if let Some(cqe) = self.tx_cq.pop() {
                 let tx_oob = ManaTxCompOob::read_from_prefix(&cqe.data[..]).unwrap().0; // TODO: zerocopy: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
@@ -942,21 +950,35 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
                         self.stats.tx_packets += 1;
                     }
                     CQE_TX_GDMA_ERR => {
-                        queue_stuck = true;
+                        // Hardware hit an error with the packet coming from the Guest.
+                        // CQE_TX_GDMA_ERR is how the Hardware indicates that it has disabled the queue.
+                        self.stats.tx_errors += 1;
+                        self.stats.tx_stuck += 1;
+                        self.trace_tx_wqe(tx_oob, done.len());
+                        // Return a TryRestart error to indicate that the queue needs to be restarted.
+                        return Err(TxError::TryRestart(anyhow::anyhow!("GDMA error")));
+                    }
+                    CQE_TX_INVALID_OOB => {
+                        // Invalid OOB means the metadata didn't match how the Hardware parsed the packet.
+                        // This is somewhat common, usually due to Encapsulation, and only the affects the specific packet.
+                        // Logging context to help understand the cause and improve handling of these packets.
+                        let first_80_bytes = self.tx_wq.read_head(100);
+                        let hex_string: String = first_80_bytes
+                            .iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        tracelimit::warn_ratelimited!(
+                            vendor_error = tx_oob.cqe_hdr.vendor_err(),
+                            first_bytes = hex_string,
+                            "tx completion error CQE_TX_INVALID_OOB"
+                        );
+                        self.stats.tx_errors += 1;
                     }
                     ty => {
                         tracelimit::error_ratelimited!(ty, "tx completion error");
                         self.stats.tx_errors += 1;
                     }
-                }
-                if queue_stuck {
-                    // Hardware hit an error with the packet coming from the Guest.
-                    // CQE_TX_GDMA_ERR is how the Hardware indicates that it has disabled the queue.
-                    self.stats.tx_errors += 1;
-                    self.stats.tx_stuck += 1;
-                    self.trace_tx_wqe(tx_oob, done.len());
-                    // Return a TryRestart error to indicate that the queue needs to be restarted.
-                    return Err(TxError::TryRestart(anyhow::anyhow!("GDMA error")));
                 }
                 let packet = self.posted_tx.pop_front().unwrap();
                 self.tx_wq.advance_head(packet.wqe_len);

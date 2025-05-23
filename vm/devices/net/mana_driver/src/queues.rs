@@ -295,6 +295,13 @@ impl Wq {
         self.head = self.head.wrapping_add(n);
     }
 
+    /// Reads from the head, the first `n` bytes.
+    pub fn read_head(&mut self, n: u32) -> Vec<u8> {
+        let mut buf = vec![0; n as usize];
+        self.mem.read_at(self.head as usize, buf.as_mut_slice());
+        buf
+    }
+
     fn write_tail(&self, offset: u32, data: &[u8]) {
         assert!(
             offset as usize % WQE_ALIGNMENT + data.len() <= WQE_ALIGNMENT,
