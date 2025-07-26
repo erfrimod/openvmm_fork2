@@ -11,8 +11,10 @@ use futures::StreamExt;
 use gdma_defs::Cqe;
 use gdma_defs::GDMA_EQE_COMPLETION;
 use gdma_defs::Sge;
+use gdma_defs::Wqe;
 use gdma_defs::bnic::CQE_RX_OKAY;
 use gdma_defs::bnic::CQE_TX_GDMA_ERR;
+use gdma_defs::bnic::CQE_TX_INVALID_OOB;
 use gdma_defs::bnic::CQE_TX_OKAY;
 use gdma_defs::bnic::MANA_LONG_PKT_FMT;
 use gdma_defs::bnic::MANA_SHORT_PKT_FMT;
@@ -20,6 +22,7 @@ use gdma_defs::bnic::ManaQueryStatisticsResponse;
 use gdma_defs::bnic::ManaRxcompOob;
 use gdma_defs::bnic::ManaTxCompOob;
 use gdma_defs::bnic::ManaTxOob;
+use gdma_defs::bnic::ManaTxShortOob;
 use guestmem::GuestMemory;
 use inspect::Inspect;
 use inspect::InspectMut;
@@ -736,9 +739,51 @@ impl<T: DeviceBacking> ManaQueue<T> {
             "tx completion error"
         );
 
-        // TODO: Use tx_wqe_offset to read the Wqe.
-        // Use Wqe.ClientOob to read the ManaTxOob.s_oob.
-        // Log properties of s_oob like checksum, etc.
+        let offset = tx_oob.offsets.tx_wqe_offset();
+        let size = size_of::<Wqe>() + size_of::<ManaTxShortOob>(); // 520
+        let bytes = self.tx_wq.read(offset, size);
+        let wqe = Wqe::read_from_prefix(&bytes);
+        match wqe {
+            Ok(wqe) => {
+                tracelimit::error_ratelimited!(
+                    wqe_num_sgl_entries = wqe.0.header.params.num_sgl_entries(),
+                    wqe_inline_client_oob_size = wqe.0.header.params.inline_client_oob_size(),
+                    wqe_client_oob_in_sgl = wqe.0.header.params.client_oob_in_sgl(),
+                    wqe_reserved = wqe.0.header.params.reserved(),
+                    wqe_gd_client_unit_data = wqe.0.header.params.gd_client_unit_data(),
+                    wqe_reserved2 = wqe.0.header.params.reserved2(),
+                    wqe_sgl_direct = wqe.0.header.params.sgl_direct(),
+                    "tx wqe header params"
+                );
+
+                let tx_s_oob = ManaTxShortOob::read_from_prefix(wqe.0.oob());
+                match tx_s_oob {
+                    Ok(tx_s_oob) => {
+                        tracelimit::error_ratelimited!(
+                            pkt_fmt = tx_s_oob.0.pkt_fmt(),
+                            is_outer_ipv4 = tx_s_oob.0.is_outer_ipv4(),
+                            is_outer_ipv6 = tx_s_oob.0.is_outer_ipv6(),
+                            comp_iphdr_csum = tx_s_oob.0.comp_iphdr_csum(),
+                            comp_tcp_csum = tx_s_oob.0.comp_tcp_csum(),
+                            comp_udp_csum = tx_s_oob.0.comp_udp_csum(),
+                            suppress_txcqe_gen = tx_s_oob.0.suppress_txcqe_gen(),
+                            vcq_num = tx_s_oob.0.vcq_num(),
+                            trans_off = tx_s_oob.0.trans_off(),
+                            vsq_frame = tx_s_oob.0.vsq_frame(),
+                            short_vp_offset = tx_s_oob.0.short_vp_offset(),
+                            "tx wqe s_oob"
+                        );
+                    }
+                    Err(_) => {
+                        tracelimit::error_ratelimited!("failed to read tx s_oob");
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                tracelimit::error_ratelimited!(size, offset, "failed to read tx WQE");
+            }
+        }
 
         if let Some(packet) = self.posted_tx.front() {
             tracelimit::error_ratelimited!(
@@ -934,7 +979,6 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
 
     fn tx_poll(&mut self, done: &mut [TxId]) -> Result<usize, TxError> {
         let mut i = 0;
-        let mut queue_stuck = false;
         while i < done.len() {
             let id = if let Some(cqe) = self.tx_cq.pop() {
                 let tx_oob = ManaTxCompOob::read_from_prefix(&cqe.data[..]).unwrap().0; // TODO: zerocopy: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
@@ -943,21 +987,24 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
                         self.stats.tx_packets += 1;
                     }
                     CQE_TX_GDMA_ERR => {
-                        queue_stuck = true;
+                        // Hardware hit an error with the packet coming from the Guest.
+                        // CQE_TX_GDMA_ERR is how the Hardware indicates that it has disabled the queue.
+                        self.stats.tx_errors += 1;
+                        self.stats.tx_stuck += 1;
+                        self.trace_tx_wqe(tx_oob, done.len());
+                        // Return a TryRestart error to indicate that the queue needs to be restarted.
+                        return Err(TxError::TryRestart(anyhow::anyhow!("GDMA error")));
+                    }
+                    CQE_TX_INVALID_OOB => {
+                        // Invalid OOB means the metadata didn't match how the Hardware parsed the packet.
+                        // This is somewhat common, usually due to Encapsulation, and only the affects the specific packet.
+                        self.stats.tx_errors += 1;
+                        self.trace_tx_wqe(tx_oob, done.len());
                     }
                     ty => {
                         tracelimit::error_ratelimited!(ty, "tx completion error");
                         self.stats.tx_errors += 1;
                     }
-                }
-                if queue_stuck {
-                    // Hardware hit an error with the packet coming from the Guest.
-                    // CQE_TX_GDMA_ERR is how the Hardware indicates that it has disabled the queue.
-                    self.stats.tx_errors += 1;
-                    self.stats.tx_stuck += 1;
-                    self.trace_tx_wqe(tx_oob, done.len());
-                    // Return a TryRestart error to indicate that the queue needs to be restarted.
-                    return Err(TxError::TryRestart(anyhow::anyhow!("GDMA error")));
                 }
                 let packet = self.posted_tx.pop_front().unwrap();
                 self.tx_wq.advance_head(packet.wqe_len);
