@@ -775,7 +775,7 @@ impl<T: DeviceBacking> ManaQueue<T> {
             gd_client_unit_data = wqe.header.params.gd_client_unit_data(),
             reserved2 = wqe.header.params.reserved2(),
             sgl_direct = wqe.header.params.sgl_direct(),
-            "wqe header params"
+            "tx wqe header"
         );
 
         let tx_s_oob = ManaTxShortOob::read_from_prefix(wqe.oob());
@@ -800,6 +800,30 @@ impl<T: DeviceBacking> ManaQueue<T> {
                 tracelimit::error_ratelimited!("failed to read tx s_oob");
             }
         }
+    }
+
+    fn trace_rx_wqe_from_offset(&mut self, wqe_offset: u32) {
+        let size = size_of::<Wqe>();
+        let bytes = self.rx_wq.read(wqe_offset, size);
+        let wqe = Wqe::read_from_prefix(&bytes);
+        let wqe = match wqe {
+            Ok((wqe, _)) => wqe,
+            Err(_) => {
+                tracelimit::error_ratelimited!(size, wqe_offset, "failed to read rx WQE");
+                return;
+            }
+        };
+
+        tracelimit::error_ratelimited!(
+            num_sgl_entries = wqe.header.params.num_sgl_entries(),
+            inline_client_oob_size = wqe.header.params.inline_client_oob_size(),
+            reserved = wqe.header.params.reserved(),
+            gd_client_unit_data = wqe.header.params.gd_client_unit_data(),
+            reserved2 = wqe.header.params.reserved2(),
+            sgl_offset = wqe.header.sgl_offset(),
+            sgl_len = wqe.header.sgl_len(),
+            "rx wqe header"
+        );
     }
 }
 
@@ -929,7 +953,14 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
                         i += 1;
                     }
                     ty => {
-                        tracelimit::error_ratelimited!(ty, "invalid rx cqe type");
+                        tracelimit::error_ratelimited!(
+                            ty,
+                            vendor_err = rx_oob.cqe_hdr.vendor_err(),
+                            rx_cq_id = self.rx_cq.id(),
+                            rx_wq_id = self.rx_wq.id(),
+                            "invalid rx cqe type"
+                        );
+                        self.trace_rx_wqe_from_offset(rx_oob.rx_wqe_offset);
                         self.stats.rx_errors += 1;
                         self.avail_rx.push_back(rx.id);
                     }
