@@ -144,6 +144,12 @@ pub enum TxError {
     #[error("unrecoverable error. {0}")]
     Fatal(#[source] anyhow::Error),
 }
+pub trait BackendQueueStats {
+    fn rx_errors(&self) -> u64;
+    fn tx_errors(&self) -> u64;
+    fn rx_packets(&self) -> u64;
+    fn tx_packets(&self) -> u64;
+}
 
 /// A trait for sending and receiving network packets.
 #[async_trait]
@@ -172,6 +178,11 @@ pub trait Queue: Send + InspectMut {
 
     /// Get the buffer access.
     fn buffer_access(&mut self) -> Option<&mut dyn BufferAccess>;
+
+    /// Get queue statistics
+    fn queue_stats(&self) -> Option<&dyn BackendQueueStats> {
+        None // Default implementation - not all queues have stats
+    }
 }
 
 /// A trait for providing access to guest memory buffers.

@@ -13,6 +13,7 @@ use gdma_defs::CqeParams;
 use gdma_defs::GDMA_EQE_COMPLETION;
 use gdma_defs::Sge;
 use gdma_defs::Wqe;
+use gdma_defs::WqeHeader;
 use gdma_defs::bnic::CQE_RX_OKAY;
 use gdma_defs::bnic::CQE_TX_GDMA_ERR;
 use gdma_defs::bnic::CQE_TX_INVALID_OOB;
@@ -37,6 +38,7 @@ use mana_driver::mana::Vport;
 use mana_driver::queues::Cq;
 use mana_driver::queues::Eq;
 use mana_driver::queues::Wq;
+use net_backend::BackendQueueStats;
 use net_backend::BufferAccess;
 use net_backend::Endpoint;
 use net_backend::EndpointAction;
@@ -803,11 +805,11 @@ impl<T: DeviceBacking> ManaQueue<T> {
     }
 
     fn trace_rx_wqe_from_offset(&mut self, wqe_offset: u32) {
-        let size = size_of::<Wqe>();
+        let size = size_of::<WqeHeader>();
         let bytes = self.rx_wq.read(wqe_offset, size);
-        let wqe = Wqe::read_from_prefix(&bytes);
-        let wqe = match wqe {
-            Ok((wqe, _)) => wqe,
+        let wqe_header = WqeHeader::read_from_prefix(&bytes);
+        let wqe_header = match wqe_header {
+            Ok((wqe_header, _)) => wqe_header,
             Err(_) => {
                 tracelimit::error_ratelimited!(size, wqe_offset, "failed to read rx WQE");
                 return;
@@ -815,14 +817,14 @@ impl<T: DeviceBacking> ManaQueue<T> {
         };
 
         tracelimit::error_ratelimited!(
-            num_sgl_entries = wqe.header.params.num_sgl_entries(),
-            inline_client_oob_size = wqe.header.params.inline_client_oob_size(),
-            reserved = wqe.header.params.reserved(),
-            gd_client_unit_data = wqe.header.params.gd_client_unit_data(),
-            reserved2 = wqe.header.params.reserved2(),
-            sgl_offset = wqe.header.sgl_offset(),
-            sgl_len = wqe.header.sgl_len(),
-            "rx wqe header"
+            num_sgl_entries = wqe_header.params.num_sgl_entries(),
+            inline_client_oob_size = wqe_header.params.inline_client_oob_size(),
+            reserved = wqe_header.params.reserved(),
+            gd_client_unit_data = wqe_header.params.gd_client_unit_data(),
+            reserved2 = wqe_header.params.reserved2(),
+            sgl_offset = wqe_header.sgl_offset(),
+            sgl_len = wqe_header.sgl_len(),
+            "ERIK rx wqe header"
         );
     }
 }
@@ -958,7 +960,7 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
                             vendor_err = rx_oob.cqe_hdr.vendor_err(),
                             rx_cq_id = self.rx_cq.id(),
                             rx_wq_id = self.rx_wq.id(),
-                            "invalid rx cqe type"
+                            "ERIK invalid rx cqe type"
                         );
                         self.trace_rx_wqe_from_offset(rx_oob.rx_wqe_offset);
                         self.stats.rx_errors += 1;
@@ -1073,6 +1075,25 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
 
     fn buffer_access(&mut self) -> Option<&mut dyn BufferAccess> {
         Some(self.pool.as_mut())
+    }
+
+    fn queue_stats(&self) -> Option<&dyn BackendQueueStats> {
+        Some(&self.stats)
+    }
+}
+
+impl BackendQueueStats for QueueStats {
+    fn rx_errors(&self) -> u64 {
+        self.rx_errors
+    }
+    fn tx_errors(&self) -> u64 {
+        self.tx_errors
+    }
+    fn rx_packets(&self) -> u64 {
+        self.rx_packets
+    }
+    fn tx_packets(&self) -> u64 {
+        self.tx_packets
     }
 }
 
@@ -1527,6 +1548,7 @@ impl Inspect for ContiguousBufferManager {
 mod tests {
     use crate::GuestDmaMode;
     use crate::ManaEndpoint;
+    use crate::QueueStats;
     use chipset_device::mmio::ExternallyManagedMmioIntercepts;
     use gdma::VportConfig;
     use gdma_defs::bnic::ManaQueryDeviceCfgResp;
@@ -1572,11 +1594,13 @@ mod tests {
         test_endpoint(driver, GuestDmaMode::DirectDma, 2048, 128).await;
     }
 
-    async fn test_endpoint(
+    async fn setup_test_endpoint(
         driver: DefaultDriver,
         dma_mode: GuestDmaMode,
-        packet_len: usize,
-        num_segments: usize,
+    ) -> (
+        DeviceTestMemory,
+        ManaEndpoint<EmulatedDevice<gdma::GdmaDevice, page_pool_alloc::PagePoolAllocator>>,
+        Vec<Box<dyn net_backend::Queue>>,
     ) {
         let pages = 256; // 1MB
         let allow_dma = dma_mode == GuestDmaMode::DirectDma;
@@ -1621,6 +1645,18 @@ mod tests {
             )
             .await
             .unwrap();
+
+        (mem, endpoint, queues)
+    }
+
+    async fn test_endpoint(
+        driver: DefaultDriver,
+        dma_mode: GuestDmaMode,
+        packet_len: usize,
+        num_segments: usize,
+    ) {
+        let (mem, mut endpoint, mut queues) = setup_test_endpoint(driver, dma_mode).await;
+        let payload_mem = mem.payload_mem();
 
         for i in 0..1000 {
             let sent_data = (0..packet_len).map(|v| (i + v) as u8).collect::<Vec<u8>>();
@@ -1680,34 +1716,150 @@ mod tests {
         endpoint.stop().await;
     }
 
+    async fn test_packet(
+        mem: &DeviceTestMemory,
+        queues: &mut [Box<dyn net_backend::Queue>],
+        header_size: u32,
+        should_succeed: bool,
+    ) {
+        let tx_id = 1;
+        let segment_count = 2; // 1 header + 1 tail
+        let gpa_offset = 0;
+        let payload_size = 1460u32;
+        let total_size = header_size + payload_size;
+        let payload_mem = mem.payload_mem();
+
+        let sent_data = (0..total_size).map(|v| v as u8).collect::<Vec<u8>>();
+        payload_mem.write_at(gpa_offset, &sent_data).unwrap();
+
+        let segments = vec![
+            TxSegment {
+                ty: net_backend::TxSegmentType::Head(net_backend::TxMetadata {
+                    id: TxId(tx_id),
+                    segment_count,
+                    len: total_size as usize,
+                    l2_len: 14,
+                    l3_len: 20,
+                    l4_len: (header_size as usize - 34) as u8, // Total header - L2 - L3
+                    offload_tcp_segmentation: false,
+                    max_tcp_segment_size: 1460,
+                    l3_protocol: net_backend::L3Protocol::Ipv4,
+                    ..Default::default()
+                }),
+                gpa: gpa_offset,
+                len: header_size,
+            },
+            TxSegment {
+                ty: net_backend::TxSegmentType::Tail,
+                gpa: gpa_offset + header_size as u64,
+                len: payload_size,
+            },
+        ];
+
+        let (_, processed) = queues[0].tx_avail(segments.as_slice()).unwrap();
+        assert_eq!(processed, segment_count, "Should process segments");
+
+        // Poll for completion
+        let mut done = [TxId(0); 1];
+        let mut done_n = 0;
+        let mut packets = [RxId(0); 2];
+        let mut packets_n = 0;
+        while done_n == 0 {
+            poll_fn(|cx| queues[0].poll_ready(cx)).await;
+            packets_n += queues[0].rx_poll(&mut packets[packets_n..]).unwrap();
+            done_n += queues[0].tx_poll(&mut done[done_n..]).unwrap();
+        }
+        assert_eq!(done_n, 1, "Should poll one completion");
+        assert_eq!(done[0].0, tx_id, "Should complete the packet");
+
+        if should_succeed {
+            assert_eq!(packets_n, 1, "Should receive one packet");
+            let rx_id = packets[0];
+
+            let packet_len = (header_size + payload_size) as usize;
+            let mut received_data = vec![0; packet_len];
+            payload_mem
+                .read_at(2048 * rx_id.0 as u64, &mut received_data)
+                .unwrap();
+            assert_eq!(received_data.len(), packet_len);
+            assert_eq!(&received_data[..], sent_data, "{:?}", rx_id);
+            queues[0].rx_avail(&[rx_id]);
+        } else {
+            assert_eq!(packets_n, 0, "Packet dropped");
+        }
+    }
+
     #[async_test]
-    async fn test_vport_with_query_filter_state(driver: DefaultDriver) {
-        let pages = 512; // 2MB
-        let mem = DeviceTestMemory::new(pages, false, "test_vport_with_query_filter_state");
-        let mut msi_set = MsiInterruptSet::new();
-        let device = gdma::GdmaDevice::new(
-            &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
-            mem.guest_memory(),
-            &mut msi_set,
-            vec![VportConfig {
-                mac_address: [1, 2, 3, 4, 5, 6].into(),
-                endpoint: Box::new(LoopbackEndpoint::new()),
-            }],
-            &mut ExternallyManagedMmioIntercepts,
+    async fn test_valid_packet(driver: DefaultDriver) {
+        let (mem, mut endpoint, mut queues) =
+            setup_test_endpoint(driver, GuestDmaMode::DirectDma).await;
+
+        let before_stats = get_queue_stats(queues[0].queue_stats());
+
+        let valid_header_size = 200;
+        let success = true;
+        test_packet(&mem, &mut queues, valid_header_size, success).await;
+
+        let after_stats = get_queue_stats(queues[0].queue_stats());
+
+        assert_eq!(
+            after_stats.tx_packets,
+            before_stats.tx_packets + 1,
+            "Expected tx_packets to increase"
         );
-        let dma_client = mem.dma_client();
-        let device = EmulatedDevice::new(device, msi_set, dma_client);
-        let cap_flags1 = gdma_defs::bnic::BasicNicDriverFlags::new().with_query_filter_state(1);
-        let dev_config = ManaQueryDeviceCfgResp {
-            pf_cap_flags1: cap_flags1,
-            pf_cap_flags2: 0,
-            pf_cap_flags3: 0,
-            pf_cap_flags4: 0,
-            max_num_vports: 1,
-            reserved: 0,
-            max_num_eqs: 64,
-        };
-        let thing = ManaDevice::new(&driver, device, 1, 1).await.unwrap();
-        let _ = thing.new_vport(0, None, &dev_config).await.unwrap();
+
+        assert_eq!(
+            after_stats.rx_packets,
+            before_stats.rx_packets + 1,
+            "Expected rx_packets to increase"
+        );
+
+        assert_eq!(
+            after_stats.tx_errors, before_stats.tx_errors,
+            "Expected tx_errors to remain the same"
+        );
+
+        assert_eq!(
+            after_stats.rx_errors, before_stats.rx_errors,
+            "Expected rx_errors to remain the same"
+        );
+
+        drop(queues);
+        endpoint.stop().await;
+    }
+
+    #[async_test]
+    async fn test_rx_error_handling(driver: DefaultDriver) {
+        let (mem, mut endpoint, mut queues) =
+            setup_test_endpoint(driver, GuestDmaMode::DirectDma).await;
+
+        let before_stats = get_queue_stats(queues[0].queue_stats());
+
+        // Special signal for loopback tx_avail to generate bad checksum
+        let bad_header_size = 222;
+        let success = false;
+        test_packet(&mem, &mut queues, bad_header_size, success).await;
+
+        let after_stats = get_queue_stats(queues[0].queue_stats());
+
+        assert_eq!(
+            after_stats.rx_errors,
+            before_stats.rx_errors + 1,
+            "Expected rx_errors to increase"
+        );
+
+        drop(queues);
+        endpoint.stop().await;
+    }
+
+    fn get_queue_stats(queue_stats: Option<&dyn net_backend::BackendQueueStats>) -> QueueStats {
+        let queue_stats = queue_stats.unwrap();
+        QueueStats {
+            rx_errors: queue_stats.rx_errors(),
+            tx_errors: queue_stats.tx_errors(),
+            rx_packets: queue_stats.rx_packets(),
+            tx_packets: queue_stats.tx_packets(),
+            ..Default::default()
+        }
     }
 }
