@@ -12,6 +12,7 @@ use self::bnic_defs::ManaSetVportSerialNo;
 use self::bnic_defs::ManaTxCompOob;
 use self::bnic_defs::ManaTxCompOobOffsets;
 use crate::VportConfig;
+use crate::bnic::bnic_defs::CQE_RX_ERR_DISABLED_QUEUE;
 use crate::bnic::bnic_defs::CQE_RX_OKAY;
 use crate::bnic::bnic_defs::ManaCfgRxSteerReq;
 use crate::bnic::bnic_defs::ManaConfigVportReq;
@@ -141,13 +142,24 @@ impl BufferAccess for GuestBuffers {
 
         let mut packets = self.rx_packets.lock();
         let packet = &mut packets[id.0 as usize];
-        packet.oob = ManaRxcompOob {
-            cqe_hdr: ManaCqeHeader::new()
-                .with_cqe_type(CQE_RX_OKAY)
-                .with_client_type(MANA_CQE_COMPLETION),
-            rx_wqe_offset: packet.wqe_offset,
-            flags,
-            ..FromZeros::new_zeroed()
+        packet.oob = if metadata.l4_checksum == RxChecksumState::Bad {
+            ManaRxcompOob {
+                cqe_hdr: ManaCqeHeader::new()
+                    .with_cqe_type(CQE_RX_ERR_DISABLED_QUEUE)
+                    .with_client_type(MANA_CQE_COMPLETION),
+                rx_wqe_offset: packet.wqe_offset,
+                flags,
+                ..FromZeros::new_zeroed()
+            }
+        } else {
+            ManaRxcompOob {
+                cqe_hdr: ManaCqeHeader::new()
+                    .with_cqe_type(CQE_RX_OKAY)
+                    .with_client_type(MANA_CQE_COMPLETION),
+                rx_wqe_offset: packet.wqe_offset,
+                flags,
+                ..FromZeros::new_zeroed()
+            }
         };
         packet.oob.ppi[0].pkt_len = metadata.len as u16;
     }

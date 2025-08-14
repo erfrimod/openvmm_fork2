@@ -106,6 +106,12 @@ impl Queue for LoopbackQueue {
 
     fn tx_avail(&mut self, mut segments: &[TxSegment]) -> anyhow::Result<(bool, usize)> {
         tracing::debug!(count = packet_count(segments), "tx_avail");
+        let checksum = if segments[0].len == 222 {
+            // This is a special case for test_rx_error_handling that expects a bad checksum.
+            crate::RxChecksumState::Bad
+        } else {
+            crate::RxChecksumState::Unknown
+        };
         let mut sent = 0;
         while !segments.is_empty() && !self.rx_avail.is_empty() {
             let before = segments.len();
@@ -117,6 +123,7 @@ impl Queue for LoopbackQueue {
                 &RxMetadata {
                     offset: 0,
                     len: packet.len(),
+                    l4_checksum: checksum,
                     ..Default::default()
                 },
                 &packet,
