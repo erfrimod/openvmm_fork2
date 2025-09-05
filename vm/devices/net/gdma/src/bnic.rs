@@ -13,6 +13,7 @@ use self::bnic_defs::ManaSetVportSerialNo;
 use self::bnic_defs::ManaTxCompOob;
 use self::bnic_defs::ManaTxCompOobOffsets;
 use crate::VportConfig;
+use crate::bnic::bnic_defs::CQE_RX_ERR_DISABLED_QUEUE;
 use crate::bnic::bnic_defs::CQE_RX_OKAY;
 use crate::bnic::bnic_defs::ManaCfgRxSteerReq;
 use crate::bnic::bnic_defs::ManaConfigVportReq;
@@ -149,6 +150,22 @@ impl BufferAccess for GuestBuffers {
             flags,
             ..FromZeros::new_zeroed()
         };
+
+        // net_mana test_rx_error_handling uses metadata.len == 1234 to signal for an error condition
+        if metadata.len == 1234 {
+            tracelimit::error_ratelimited!(
+                metadata_len = metadata.len,
+                "Returning CQE_RX_ERR_DISABLED_QUEUE to test rx error handling"
+            );
+            packet.oob = ManaRxcompOob {
+                cqe_hdr: ManaCqeHeader::new()
+                    .with_cqe_type(CQE_RX_ERR_DISABLED_QUEUE)
+                    .with_client_type(MANA_CQE_COMPLETION),
+                rx_wqe_offset: packet.wqe_offset,
+                flags,
+                ..FromZeros::new_zeroed()
+            };
+        }
         packet.oob.ppi[0].pkt_len = metadata.len as u16;
     }
 }
