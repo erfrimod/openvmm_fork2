@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use self::bnic_defs::CQE_TX_GDMA_ERR;
 use self::bnic_defs::CQE_TX_OKAY;
 use self::bnic_defs::MANA_CQE_COMPLETION;
 use self::bnic_defs::ManaCommandCode;
@@ -12,6 +13,7 @@ use self::bnic_defs::ManaSetVportSerialNo;
 use self::bnic_defs::ManaTxCompOob;
 use self::bnic_defs::ManaTxCompOobOffsets;
 use crate::VportConfig;
+use crate::bnic::bnic_defs::CQE_RX_ERR_DISABLED_QUEUE;
 use crate::bnic::bnic_defs::CQE_RX_OKAY;
 use crate::bnic::bnic_defs::ManaCfgRxSteerReq;
 use crate::bnic::bnic_defs::ManaConfigVportReq;
@@ -149,6 +151,22 @@ impl BufferAccess for GuestBuffers {
             flags,
             ..FromZeros::new_zeroed()
         };
+
+        // net_mana test_rx_error_handling uses metadata.len == 1234 to signal for an error condition
+        if metadata.len == 1234 {
+            tracelimit::error_ratelimited!(
+                metadata_len = metadata.len,
+                "Returning CQE_RX_ERR_DISABLED_QUEUE to test rx error handling"
+            );
+            packet.oob = ManaRxcompOob {
+                cqe_hdr: ManaCqeHeader::new()
+                    .with_cqe_type(CQE_RX_ERR_DISABLED_QUEUE)
+                    .with_client_type(MANA_CQE_COMPLETION),
+                rx_wqe_offset: packet.wqe_offset,
+                flags,
+                ..FromZeros::new_zeroed()
+            };
+        }
         packet.oob.ppi[0].pkt_len = metadata.len as u16;
     }
 }
@@ -560,6 +578,30 @@ impl TxRxTask {
             meta.offload_tcp_segmentation = true;
         }
 
+        // With LSO, the first SGE is the header and the rest are the payload.
+        // For LSO, the requirements by the GDMA hardware are:
+        // - The first SGE must be the header and must be <= 256 bytes.
+        // - There should be at least two SGEs.
+        // TODO: Disable the Queue to mimick the hardware behavior.
+        if meta.offload_tcp_segmentation {
+            if sqe.sgl().len() < 2 {
+                tracelimit::error_ratelimited!(
+                    sgl_count = sqe.sgl().len(),
+                    "LSO enabled, but only one SGE"
+                );
+                self.post_tx_completion_error();
+                return Ok(());
+            }
+            if sge0.size > 256 {
+                tracelimit::error_ratelimited!(
+                    sge0_size = sge0.size,
+                    "LSO enabled and SGE[0] size > 256 bytes"
+                );
+                self.post_tx_completion_error();
+                return Ok(());
+            }
+        }
+
         let tx_segments = &mut self.tx_segment_buffer;
         tx_segments.clear();
         tx_segments.push(TxSegment {
@@ -580,6 +622,20 @@ impl TxRxTask {
             self.post_tx_completion();
         }
         Ok(())
+    }
+
+    // TODO: Provide proper OOB data for the GDMA error.
+    fn post_tx_completion_error(&mut self) {
+        let tx_oob = ManaTxCompOob {
+            cqe_hdr: ManaCqeHeader::new()
+                .with_client_type(MANA_CQE_COMPLETION)
+                .with_cqe_type(CQE_TX_GDMA_ERR),
+            tx_data_offset: 0,
+            offsets: ManaTxCompOobOffsets::new(),
+            reserved: [0; 12],
+        };
+        self.queues
+            .post_cq(self.sq_cq_id, tx_oob.as_bytes(), self.sq_id, true);
     }
 
     fn post_tx_completion(&mut self) {

@@ -2427,6 +2427,7 @@ dependencies = [
  "slab",
  "task_control",
  "thiserror 2.0.16",
+ "tracelimit",
  "tracing",
  "vm_resource",
  "vmcore",
