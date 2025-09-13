@@ -4199,7 +4199,7 @@ impl Coordinator {
                 _ => primary.guest_vf_state,
             };
         } else {
-            // If the device was just removed, make sure the the data path is synthetic.
+            // If the device was just removed, make sure the data path is synthetic.
             match primary.guest_vf_state {
                 PrimaryChannelGuestVfState::DataPathSwitchPending { to_guest, .. }
                 | PrimaryChannelGuestVfState::Restoring(
@@ -5452,7 +5452,7 @@ impl<T: 'static + RingMem> NetChannel<T> {
     ) -> Result<usize, WorkerError> {
         let mut num_packets = 0;
         let tx_packet = &mut state.pending_tx_packets[id.0 as usize];
-        assert!(tx_packet.pending_packet_count == 0);
+        assert_eq!(tx_packet.pending_packet_count, 0);
         tx_packet.transaction_id = packet
             .transaction_id
             .ok_or(WorkerError::MissingTransactionId)?;
