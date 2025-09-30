@@ -2308,8 +2308,12 @@ impl<T: RingMem> NetChannel<T> {
                 )?;
                 true
             }
-            rndisprot::MESSAGE_TYPE_HALT_MSG => false,
+            rndisprot::MESSAGE_TYPE_HALT_MSG => {
+                tracing::error!("FROMGUEST rndisprot::MESSAGE_TYPE_HALT_MSG");
+                false
+            }
             n => {
+                tracing::error!(n, "FROMGUEST rndisprot ControlMessage");
                 let control = state
                     .primary
                     .as_mut()
@@ -2748,6 +2752,8 @@ impl<T: RingMem> NetChannel<T> {
         let buffer_range = &buffers.recv_buffer.range(id);
         match message_type {
             rndisprot::MESSAGE_TYPE_INITIALIZE_MSG => {
+                tracing::error!("FROMGUEST rndisprot::MESSAGE_TYPE_INITIALIZE_MSG");
+
                 if primary.rndis_state != RndisState::Initializing {
                     return Err(WorkerError::InvalidRndisState);
                 }
@@ -2780,6 +2786,7 @@ impl<T: RingMem> NetChannel<T> {
                         af_list_size: 0,
                     },
                 )?;
+                tracing::error!("TOGUEST rndisprot::MESSAGE_TYPE_INITIALIZE_CMPLT");
                 self.send_rndis_control_message(buffers, id, message_length)?;
                 if let PrimaryChannelGuestVfState::Available { vfid } = primary.guest_vf_state {
                     if self.guest_vf_is_available(
@@ -2808,6 +2815,7 @@ impl<T: RingMem> NetChannel<T> {
                 }
             }
             rndisprot::MESSAGE_TYPE_QUERY_MSG => {
+                tracing::error!("FROMGUEST rndisprot::MESSAGE_TYPE_QUERY_MSG");
                 let request: rndisprot::QueryRequest = reader.read_plain()?;
 
                 tracing::trace!(?request, "handling control message MESSAGE_TYPE_QUERY_MSG");
@@ -2839,9 +2847,11 @@ impl<T: RingMem> NetChannel<T> {
                         information_buffer_length: tx as u32,
                     },
                 )?;
+                tracing::error!("TOGUEST rndisprot::MESSAGE_TYPE_QUERY_CMPLT");
                 self.send_rndis_control_message(buffers, id, message_length)?;
             }
             rndisprot::MESSAGE_TYPE_SET_MSG => {
+                tracing::error!("FROMGUEST rndisprot::MESSAGE_TYPE_SET_MSG");
                 let request: rndisprot::SetRequest = reader.read_plain()?;
 
                 tracing::trace!(?request, "handling control message MESSAGE_TYPE_SET_MSG");
@@ -2876,15 +2886,20 @@ impl<T: RingMem> NetChannel<T> {
                         status,
                     },
                 )?;
+                tracing::error!("TOGUEST rndisprot::MESSAGE_TYPE_SET_CMPLT");
                 self.send_rndis_control_message(buffers, id, message_length)?;
             }
             rndisprot::MESSAGE_TYPE_RESET_MSG => {
+                tracing::error!("FROMGUEST rndisprot::MESSAGE_TYPE_RESET_MSG");
                 return Err(WorkerError::RndisMessageTypeNotImplemented);
             }
             rndisprot::MESSAGE_TYPE_INDICATE_STATUS_MSG => {
+                tracing::error!("FROMGUEST rndisprot::MESSAGE_TYPE_INDICATE_STATUS_MSG");
                 return Err(WorkerError::RndisMessageTypeNotImplemented);
             }
             rndisprot::MESSAGE_TYPE_KEEPALIVE_MSG => {
+                tracing::error!("FROMGUEST rndisprot::MESSAGE_TYPE_KEEPALIVE_MSG");
+
                 let request: rndisprot::KeepaliveRequest = reader.read_plain()?;
 
                 tracing::trace!(
@@ -2901,12 +2916,17 @@ impl<T: RingMem> NetChannel<T> {
                         status: rndisprot::STATUS_SUCCESS,
                     },
                 )?;
+                tracing::error!("TOGUEST rndisprot::MESSAGE_TYPE_KEEPALIVE_CMPLT");
                 self.send_rndis_control_message(buffers, id, message_length)?;
             }
             rndisprot::MESSAGE_TYPE_SET_EX_MSG => {
+                tracing::error!("FROMGUEST rndisprot::MESSAGE_TYPE_SET_EX_MSG");
                 return Err(WorkerError::RndisMessageTypeNotImplemented);
             }
-            _ => return Err(WorkerError::UnknownRndisMessageType(message_type)),
+            _ => {
+                tracing::error!(message_type, "GUEST rndisprot::UnknownMessageType");
+                return Err(WorkerError::UnknownRndisMessageType(message_type));
+            }
         };
         Ok(())
     }
@@ -2985,6 +3005,7 @@ impl<T: RingMem> NetChannel<T> {
             },
         )?;
         writer.write(payload)?;
+        tracing::error!("TOGUEST rndisprot::MESSAGE_TYPE_INDICATE_STATUS_MSG");
         self.send_rndis_control_message(buffers, id, message_length)?;
         Ok(())
     }
@@ -3150,6 +3171,8 @@ impl Adapter {
         let available_len = writer.len();
         match oid {
             rndisprot::Oid::OID_GEN_SUPPORTED_LIST => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_SUPPORTED_LIST");
+
                 let supported_oids_common = &[
                     rndisprot::Oid::OID_GEN_SUPPORTED_LIST,
                     rndisprot::Oid::OID_GEN_HARDWARE_STATUS,
@@ -3229,34 +3252,56 @@ impl Adapter {
                 }
             }
             rndisprot::Oid::OID_GEN_HARDWARE_STATUS => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_HARDWARE_STATUS");
+
                 let status: u32 = 0; // NdisHardwareStatusReady
                 writer.write(status.as_bytes())?;
             }
             rndisprot::Oid::OID_GEN_MEDIA_SUPPORTED | rndisprot::Oid::OID_GEN_MEDIA_IN_USE => {
+                tracing::error!(
+                    "FROMGUEST rndisprot::Oid::OID_GEN_MEDIA_IN_USE OID_GEN_MEDIA_SUPPORTED"
+                );
+
                 writer.write(rndisprot::MEDIUM_802_3.as_bytes())?;
             }
             rndisprot::Oid::OID_GEN_MAXIMUM_LOOKAHEAD
             | rndisprot::Oid::OID_GEN_CURRENT_LOOKAHEAD
             | rndisprot::Oid::OID_GEN_MAXIMUM_FRAME_SIZE => {
+                tracing::error!(
+                    "FROMGUEST rndisprot::Oid::OID_GEN_MAXIMUM_LOOKAHEAD OID_GEN_CURRENT_LOOKAHEAD OID_GEN_MAXIMUM_FRAME_SIZE"
+                );
+
                 let len: u32 = buffers.ndis_config.mtu - ETHERNET_HEADER_LEN;
                 writer.write(len.as_bytes())?;
             }
             rndisprot::Oid::OID_GEN_MAXIMUM_TOTAL_SIZE
             | rndisprot::Oid::OID_GEN_TRANSMIT_BLOCK_SIZE
             | rndisprot::Oid::OID_GEN_RECEIVE_BLOCK_SIZE => {
+                tracing::error!(
+                    "FROMGUEST rndisprot::Oid::OID_GEN_MAXIMUM_TOTAL_SIZE OID_GEN_TRANSMIT_BLOCK_SIZE OID_GEN_RECEIVE_BLOCK_SIZE"
+                );
+
                 let len: u32 = buffers.ndis_config.mtu;
                 writer.write(len.as_bytes())?;
             }
             rndisprot::Oid::OID_GEN_LINK_SPEED => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_LINK_SPEED");
+
                 let speed: u32 = (self.link_speed / 100) as u32; // In 100bps units
                 writer.write(speed.as_bytes())?;
             }
             rndisprot::Oid::OID_GEN_TRANSMIT_BUFFER_SPACE
             | rndisprot::Oid::OID_GEN_RECEIVE_BUFFER_SPACE => {
+                tracing::error!(
+                    "FROMGUEST rndisprot::Oid::OID_GEN_TRANSMIT_BUFFER_SPACE OID_GEN_RECEIVE_BUFFER_SPACE"
+                );
+
                 // This value is meaningless for virtual NICs. Return what vmswitch returns.
                 writer.write((256u32 * 1024).as_bytes())?
             }
             rndisprot::Oid::OID_GEN_VENDOR_ID => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_VENDOR_ID");
+
                 // Like vmswitch, use the first N bytes of Microsoft's MAC address
                 // prefix as the vendor ID.
                 writer.write(0x0000155du32.as_bytes())?;
@@ -3264,20 +3309,33 @@ impl Adapter {
             rndisprot::Oid::OID_GEN_VENDOR_DESCRIPTION => writer.write(b"Microsoft Corporation")?,
             rndisprot::Oid::OID_GEN_VENDOR_DRIVER_VERSION
             | rndisprot::Oid::OID_GEN_DRIVER_VERSION => {
+                tracing::error!(
+                    "FROMGUEST rndisprot::Oid::OID_GEN_VENDOR_DESCRIPTION OID_GEN_VENDOR_DRIVER_VERSION OID_GEN_DRIVER_VERSION"
+                );
+
                 writer.write(0x0100u16.as_bytes())? // 1.0. Vmswitch reports 19.0 for Mn.
             }
-            rndisprot::Oid::OID_GEN_CURRENT_PACKET_FILTER => writer.write(0u32.as_bytes())?,
+            rndisprot::Oid::OID_GEN_CURRENT_PACKET_FILTER => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_CURRENT_PACKET_FILTER");
+                writer.write(0u32.as_bytes())?;
+            }
             rndisprot::Oid::OID_GEN_MAC_OPTIONS => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_MAC_OPTIONS");
                 let options: u32 = rndisprot::MAC_OPTION_COPY_LOOKAHEAD_DATA
                     | rndisprot::MAC_OPTION_TRANSFERS_NOT_PEND
                     | rndisprot::MAC_OPTION_NO_LOOPBACK;
                 writer.write(options.as_bytes())?;
             }
             rndisprot::Oid::OID_GEN_MEDIA_CONNECT_STATUS => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_MEDIA_CONNECT_STATUS");
                 writer.write(rndisprot::MEDIA_STATE_CONNECTED.as_bytes())?;
             }
-            rndisprot::Oid::OID_GEN_MAXIMUM_SEND_PACKETS => writer.write(u32::MAX.as_bytes())?,
+            rndisprot::Oid::OID_GEN_MAXIMUM_SEND_PACKETS => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_MAXIMUM_SEND_PACKETS");
+                writer.write(u32::MAX.as_bytes())?;
+            }
             rndisprot::Oid::OID_GEN_FRIENDLY_NAME => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_FRIENDLY_NAME");
                 let name16: Vec<u16> = "Network Device".encode_utf16().collect();
                 let mut name = rndisprot::FriendlyName::new_zeroed();
                 name.name[..name16.len()].copy_from_slice(&name16);
@@ -3285,17 +3343,27 @@ impl Adapter {
             }
             rndisprot::Oid::OID_802_3_PERMANENT_ADDRESS
             | rndisprot::Oid::OID_802_3_CURRENT_ADDRESS => {
+                tracing::error!(
+                    "FROMGUEST rndisprot::Oid::OID_802_3_PERMANENT_ADDRESS OID_802_3_CURRENT_ADDRESS"
+                );
                 writer.write(&self.mac_address.to_bytes())?
             }
             rndisprot::Oid::OID_802_3_MAXIMUM_LIST_SIZE => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_802_3_MAXIMUM_LIST_SIZE");
                 writer.write(0u32.as_bytes())?;
             }
             rndisprot::Oid::OID_802_3_RCV_ERROR_ALIGNMENT
             | rndisprot::Oid::OID_802_3_XMIT_ONE_COLLISION
-            | rndisprot::Oid::OID_802_3_XMIT_MORE_COLLISIONS => writer.write(0u32.as_bytes())?,
+            | rndisprot::Oid::OID_802_3_XMIT_MORE_COLLISIONS => {
+                tracing::error!(
+                    "FROMGUEST rndisprot::Oid::OID_802_3_XMIT_MORE_COLLISIONS OID_802_3_XMIT_ONE_COLLISION OID_802_3_RCV_ERROR_ALIGNMENT"
+                );
+                writer.write(0u32.as_bytes())?;
+            }
 
             // NDIS6 OIDs:
             rndisprot::Oid::OID_GEN_LINK_STATE => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_LINK_STATE");
                 let link_state = rndisprot::LinkState {
                     header: rndisprot::NdisObjectHeader {
                         object_type: rndisprot::NdisObjectType::DEFAULT,
@@ -3313,6 +3381,7 @@ impl Adapter {
                 writer.write(link_state.as_bytes())?;
             }
             rndisprot::Oid::OID_GEN_MAX_LINK_SPEED => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_MAX_LINK_SPEED");
                 let link_speed = rndisprot::LinkSpeed {
                     xmit: self.link_speed,
                     rcv: self.link_speed,
@@ -3320,14 +3389,17 @@ impl Adapter {
                 writer.write(link_speed.as_bytes())?;
             }
             rndisprot::Oid::OID_TCP_OFFLOAD_HARDWARE_CAPABILITIES => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_TCP_OFFLOAD_HARDWARE_CAPABILITIES");
                 let ndis_offload = self.offload_support.ndis_offload();
                 writer.write(&ndis_offload.as_bytes()[..ndis_offload.header.size.into()])?;
             }
             rndisprot::Oid::OID_TCP_OFFLOAD_CURRENT_CONFIG => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_TCP_OFFLOAD_CURRENT_CONFIG");
                 let ndis_offload = primary.offload_config.ndis_offload();
                 writer.write(&ndis_offload.as_bytes()[..ndis_offload.header.size.into()])?;
             }
             rndisprot::Oid::OID_OFFLOAD_ENCAPSULATION => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_OFFLOAD_ENCAPSULATION");
                 writer.write(
                     &rndisprot::NdisOffloadEncapsulation {
                         header: rndisprot::NdisObjectHeader {
@@ -3346,6 +3418,7 @@ impl Adapter {
                 )?;
             }
             rndisprot::Oid::OID_GEN_RECEIVE_SCALE_CAPABILITIES => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_RECEIVE_SCALE_CAPABILITIES");
                 writer.write(
                     &rndisprot::NdisReceiveScaleCapabilities {
                         header: rndisprot::NdisObjectHeader {
@@ -3391,21 +3464,29 @@ impl Adapter {
         let mut packet_filter = None;
         match oid {
             rndisprot::Oid::OID_GEN_CURRENT_PACKET_FILTER => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_CURRENT_PACKET_FILTER");
                 packet_filter = self.oid_set_packet_filter(reader)?;
             }
             rndisprot::Oid::OID_TCP_OFFLOAD_PARAMETERS => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_TCP_OFFLOAD_PARAMETERS");
                 self.oid_set_offload_parameters(reader, primary)?;
             }
             rndisprot::Oid::OID_OFFLOAD_ENCAPSULATION => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_OFFLOAD_ENCAPSULATION");
                 self.oid_set_offload_encapsulation(reader)?;
             }
             rndisprot::Oid::OID_GEN_RNDIS_CONFIG_PARAMETER => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_RNDIS_CONFIG_PARAMETER");
                 self.oid_set_rndis_config_parameter(reader, primary)?;
             }
             rndisprot::Oid::OID_GEN_NETWORK_LAYER_ADDRESSES => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_NETWORK_LAYER_ADDRESSES");
+
                 // TODO
             }
             rndisprot::Oid::OID_GEN_RECEIVE_SCALE_PARAMETERS => {
+                tracing::error!("FROMGUEST rndisprot::Oid::OID_GEN_RECEIVE_SCALE_PARAMETERS");
+
                 self.oid_set_rss_parameters(reader, primary)?;
 
                 // Endpoints cannot currently change RSS parameters without
