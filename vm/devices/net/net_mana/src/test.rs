@@ -573,6 +573,116 @@ async fn test_vport_with_query_filter_state(driver: DefaultDriver) {
     let _ = thing.new_vport(0, None, &dev_config).await.unwrap();
 }
 
+#[async_test]
+async fn test_error_trace_on_different_channel(driver: DefaultDriver) {
+    let pages = 1024; // 4MB
+    let dma_mode = GuestDmaMode::DirectDma;
+    let allow_dma = dma_mode == GuestDmaMode::DirectDma;
+    let mem: DeviceTestMemory = DeviceTestMemory::new(pages * 2, allow_dma, "test_endpoint");
+    let payload_mem = mem.payload_mem();
+
+    let mut msi_set = MsiInterruptSet::new();
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &mut msi_set,
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_set, mem.dma_client());
+    let dev_config = ManaQueryDeviceCfgResp {
+        pf_cap_flags1: 0.into(),
+        pf_cap_flags2: 0,
+        pf_cap_flags3: 0,
+        pf_cap_flags4: 0,
+        max_num_vports: 1,
+        reserved: 0,
+        max_num_eqs: 64,
+    };
+    let thing = ManaDevice::new(&driver, device, 1, 2, None).await.unwrap();
+    let vport = thing.new_vport(0, None, &dev_config).await.unwrap();
+    let mut endpoint = ManaEndpoint::new(driver.clone(), vport, dma_mode).await;
+    let mut queues = Vec::new();
+    let mut queue_configs = Vec::new();
+    let pool = net_backend::tests::Bufs::new(payload_mem.clone());
+    let init_rx = &(0..64).map(RxId).collect::<Vec<_>>();
+    let init_rx2 = &(64..128).map(RxId).collect::<Vec<_>>();
+    queue_configs.push(QueueConfig {
+        pool: Box::new(pool.clone()),
+        initial_rx: init_rx,
+        driver: Box::new(driver.clone()),
+    });
+    queue_configs.push(QueueConfig {
+        pool: Box::new(pool.clone()),
+        initial_rx: init_rx2,
+        driver: Box::new(driver.clone()),
+    });
+    endpoint
+        .get_queues(queue_configs, None, &mut queues)
+        .await
+        .unwrap();
+    assert!(queues.len() > 1);
+
+    let packet_len: usize = 1024;
+    let num_segments: u8 = 1;
+    let sent_data = (0..packet_len).map(|v| v as u8).collect::<Vec<u8>>();
+    payload_mem.write_at(0, &sent_data).unwrap();
+
+    let mut segments = Vec::new();
+    let segment_len = packet_len / num_segments as usize;
+    assert!(packet_len.is_multiple_of(num_segments as usize));
+    assert!(sent_data.len() == packet_len);
+
+    // Use a valid non-LSO packet (LSO with 1 segment is invalid)
+    let tx_metadata = net_backend::TxMetadata {
+        id: TxId(1),
+        segment_count: num_segments,
+        len: sent_data.len() as u32,
+        ..Default::default()
+    };
+
+    segments.push(TxSegment {
+        ty: net_backend::TxSegmentType::Head(tx_metadata),
+        gpa: 0,
+        len: segment_len as u32,
+    });
+
+    assert!(segments.len() == num_segments as usize);
+
+    let queue_idx = 1;
+    queues[queue_idx].tx_avail(segments.as_slice()).unwrap();
+
+    let mut packets = [RxId(0); 2];
+    let mut done = [TxId(0); 2];
+    let mut done_n = 0;
+    let mut packets_n = 0;
+    while done_n == 0 || packets_n == 0 {
+        poll_fn(|cx| queues[queue_idx].poll_ready(cx)).await;
+        packets_n += queues[queue_idx]
+            .rx_poll(&mut packets[packets_n..])
+            .unwrap();
+        done_n += queues[queue_idx].tx_poll(&mut done[done_n..]).unwrap();
+    }
+    assert_eq!(packets_n, 1);
+    let rx_id = packets[0];
+
+    let mut received_data = vec![0; packet_len];
+    payload_mem
+        .read_at(2048 * rx_id.0 as u64, &mut received_data)
+        .unwrap();
+    assert!(received_data.len() == packet_len);
+    assert_eq!(&received_data[..], sent_data, "{:?}", rx_id);
+    assert_eq!(done_n, 1);
+    assert_eq!(done[0].0, 1);
+    queues[queue_idx].rx_avail(&[rx_id]);
+
+    drop(queues);
+    endpoint.stop().await;
+}
+
 async fn send_test_packet(
     driver: DefaultDriver,
     dma_mode: GuestDmaMode,
