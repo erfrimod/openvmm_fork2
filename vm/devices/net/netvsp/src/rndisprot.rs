@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#![expect(dead_code)]
+#![cfg_attr(not(feature = "test"), expect(dead_code))]
+#![cfg_attr(feature = "test", allow(dead_code))]
 
 use bitfield_struct::bitfield;
 use open_enum::open_enum;
@@ -108,6 +109,7 @@ pub const STATUS_TOKEN_RING_OPEN_ERROR: Status = 0xC0011000;
 
 open_enum! {
     #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
     pub enum Oid: u32 {
         OID_GEN_SUPPORTED_LIST = 0x00010101,
         OID_GEN_HARDWARE_STATUS = 0x00010102,
@@ -503,6 +505,7 @@ pub struct KeepaliveComplete {
 //
 #[repr(C)]
 #[derive(Debug, Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Packet {
     pub data_offset: u32,
     pub data_length: u32,
@@ -737,6 +740,7 @@ pub const CONFIG_PARAM_TYPE_STRING: u32 = 2;
 //
 #[repr(C)]
 #[derive(Debug, Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct MessageHeader {
     pub message_type: u32,
 
@@ -747,6 +751,7 @@ pub struct MessageHeader {
 
 open_enum! {
     #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
     pub enum NdisObjectType: u8 {
         DEFAULT = 0x80,
         RSS_CAPABILITIES = 0x88,
@@ -759,6 +764,7 @@ open_enum! {
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct NdisObjectHeader {
     pub object_type: NdisObjectType,
     pub revision: u8,
@@ -780,6 +786,7 @@ pub const NDIS_SIZEOF_RECEIVE_SCALE_CAPABILITIES_REVISION_2: usize = 18;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct NdisReceiveScaleParameters {
     pub header: NdisObjectHeader,
 
@@ -984,6 +991,7 @@ pub struct Ipv6LsoFlags {
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct NdisOffloadEncapsulation {
     pub header: NdisObjectHeader,
     pub ipv4_enabled: u32,
@@ -1005,6 +1013,7 @@ pub const NDIS_OFFLOAD_SET_OFF: u32 = 2;
 
 #[repr(C)]
 #[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct NdisOffloadParameters {
     pub header: NdisObjectHeader,
     pub ipv4_checksum: OffloadParametersChecksum,
@@ -1026,6 +1035,7 @@ pub const NDIS_SIZEOF_OFFLOAD_PARAMETERS_REVISION_1: usize = 20;
 
 open_enum! {
     #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
     pub enum OffloadParametersChecksum: u8 {
         NO_CHANGE = 0,
         TX_RX_DISABLED = 1,
@@ -1049,6 +1059,7 @@ impl OffloadParametersChecksum {
 
 open_enum! {
     #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
     pub enum OffloadParametersSimple: u8 {
         NO_CHANGE = 0,
         DISABLED = 1,
@@ -1069,6 +1080,7 @@ impl OffloadParametersSimple {
 
 #[repr(C)]
 #[derive(Copy, Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct RndisConfigParameterInfo {
     pub name_offset: u32,
     pub name_length: u32,
@@ -1079,6 +1091,7 @@ pub struct RndisConfigParameterInfo {
 
 open_enum! {
     #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
     pub enum NdisParameterType: u32 {
         INTEGER = 0,
         HEX_INTEGER = 1,

@@ -7,12 +7,22 @@
 #![forbid(unsafe_code)]
 
 mod buffers;
+#[cfg(feature = "test")]
+pub mod protocol;
+#[cfg(not(feature = "test"))]
 mod protocol;
 pub mod resolver;
+#[cfg(feature = "test")]
+pub mod rndisprot;
+#[cfg(not(feature = "test"))]
 mod rndisprot;
 mod rx_bufs;
 mod saved_state;
 mod test;
+#[cfg(feature = "test")]
+pub mod test_helpers;
+#[cfg(not(feature = "test"))]
+mod test_helpers;
 
 use crate::buffers::GuestBuffers;
 use crate::protocol::VMS_SWITCH_RSS_MAX_SEND_INDIRECTION_TABLE_ENTRIES;
