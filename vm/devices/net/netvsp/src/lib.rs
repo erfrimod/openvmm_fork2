@@ -4664,6 +4664,7 @@ impl<T: RingMem + 'static> Worker<T> {
                         Err(WorkerError::EndpointRequiresQueueRestart(err)) => {
                             tracelimit::warn_ratelimited!(
                                 err = err.as_ref() as &dyn std::error::Error,
+                                channel_idx = self.channel_idx,
                                 "Endpoint requires queues to restart",
                             );
                             CoordinatorMessage::Restart

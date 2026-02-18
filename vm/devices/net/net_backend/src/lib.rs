@@ -151,6 +151,8 @@ pub trait BackendQueueStats {
     fn tx_errors(&self) -> Counter;
     fn rx_packets(&self) -> Counter;
     fn tx_packets(&self) -> Counter;
+    /// Number of TX queue disable events (CQE_TX_GDMA_ERR).
+    fn tx_stuck(&self) -> Counter;
 }
 
 /// A trait for sending and receiving network packets.

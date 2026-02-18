@@ -1110,6 +1110,9 @@ impl BackendQueueStats for QueueStats {
     fn tx_packets(&self) -> Counter {
         self.tx_packets.clone()
     }
+    fn tx_stuck(&self) -> Counter {
+        self.tx_stuck.clone()
+    }
 }
 
 impl<T: DeviceBacking> ManaQueue<T> {

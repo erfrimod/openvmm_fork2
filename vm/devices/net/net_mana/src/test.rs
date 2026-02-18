@@ -385,6 +385,8 @@ async fn test_lso_segment_coalescing_only_header(driver: DefaultDriver) {
     });
 
     expected_stats.as_mut().unwrap().tx_errors.add(1);
+    // CQE_TX_GDMA_ERR also increments tx_stuck (queue disable indicator).
+    expected_stats.as_mut().unwrap().tx_stuck.add(1);
     let test_config = Some(ManaTestConfiguration {
         allow_lso_pkt_with_one_sge: true,
     });
@@ -646,6 +648,11 @@ async fn send_test_packet_multi(
         expected_stats.rx_errors.get(),
         "rx_errors mismatch"
     );
+    assert_eq!(
+        stats.tx_stuck.get(),
+        expected_stats.tx_stuck.get(),
+        "tx_stuck mismatch"
+    );
 }
 
 fn build_tx_segments(
@@ -836,6 +843,47 @@ fn get_queue_stats(queue_stats: Option<&dyn net_backend::BackendQueueStats>) -> 
         tx_errors: queue_stats.tx_errors(),
         rx_packets: queue_stats.rx_packets(),
         tx_packets: queue_stats.tx_packets(),
+        tx_stuck: queue_stats.tx_stuck(),
         ..Default::default()
     }
+}
+
+/// Verifies that a CQE_TX_GDMA_ERR (queue disable event) correctly
+/// attributes the error to the right queue via the `tx_stuck` counter
+/// exposed through `BackendQueueStats`. This ensures that UH diag can
+/// identify which queue experienced the error by inspecting per-queue
+/// `tx_stuck` counts.
+#[async_test]
+async fn test_cqe_gdma_err_queue_attribution(driver: DefaultDriver) {
+    let segment_len = IPV4_HEADER_LENGTH;
+    let num_segments = 1;
+    let packet_len = num_segments * segment_len;
+
+    // Send an LSO packet with only a header (single SGE), which the
+    // emulated GDMA will reject with CQE_TX_GDMA_ERR when
+    // allow_lso_pkt_with_one_sge bypasses the driver-side check.
+    let mut expected_stats = Some(QueueStats {
+        tx_packets: Counter::new(),
+        rx_packets: Counter::new(),
+        tx_errors: Counter::new(),
+        rx_errors: Counter::new(),
+        ..Default::default()
+    });
+    // CQE_TX_GDMA_ERR increments both tx_errors and tx_stuck.
+    expected_stats.as_mut().unwrap().tx_errors.add(1);
+    expected_stats.as_mut().unwrap().tx_stuck.add(1);
+
+    let test_config = Some(ManaTestConfiguration {
+        allow_lso_pkt_with_one_sge: true,
+    });
+    send_test_packet(
+        driver.clone(),
+        GuestDmaMode::DirectDma,
+        packet_len,
+        num_segments,
+        true, // LSO
+        test_config,
+        expected_stats,
+    )
+    .await;
 }
