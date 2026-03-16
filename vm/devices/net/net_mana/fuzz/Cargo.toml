@@ -1,0 +1,47 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "fuzz_net_mana"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gdma.workspace = true
+gdma_defs.workspace = true
+mana_driver.workspace = true
+net_mana.workspace = true
+net_backend.workspace = true
+
+chipset_device.workspace = true
+pci_core.workspace = true
+user_driver_emulated_mock.workspace = true
+vmcore.workspace = true
+
+pal_async.workspace = true
+mesh.workspace = true
+xtask_fuzz.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libfuzzer-sys.workspace = true
+
+[package.metadata.xtask.unused-deps]
+# required for the xtask_fuzz macro, but unused_deps doesn't know that
+ignored = ["libfuzzer-sys"]
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.xtask.fuzz.onefuzz-allowlist]
+fuzz_net_mana_tx_avail = ["fuzz_net_mana_tx_avail.rs", "../../net_mana/src/**/*.rs", "../../mana_driver/src/**/*.rs"]
+
+[[bin]]
+name = "fuzz_net_mana_tx_avail"
+path = "fuzz_net_mana_tx_avail.rs"
+test = false
+doc = false
+doctest = false
+
+[lints]
+workspace = true

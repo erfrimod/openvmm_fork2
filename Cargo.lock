@@ -2371,6 +2371,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuzz_net_mana"
+version = "0.0.0"
+dependencies = [
+ "chipset_device",
+ "gdma",
+ "gdma_defs",
+ "libfuzzer-sys",
+ "mana_driver",
+ "mesh",
+ "net_backend",
+ "net_mana",
+ "pal_async",
+ "pci_core",
+ "user_driver_emulated_mock",
+ "vmcore",
+ "xtask_fuzz",
+]
+
+[[package]]
 name = "fuzz_nvme_driver"
 version = "0.0.0"
 dependencies = [

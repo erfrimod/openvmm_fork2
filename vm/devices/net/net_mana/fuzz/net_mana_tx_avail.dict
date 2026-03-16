@@ -1,0 +1,98 @@
+# Dictionary for fuzz_net_mana_tx_avail.
+#
+# Packet wire format (LE):
+#   [0]    segment_count
+#   [1]    flags (TxFlags)
+#   [2]    l2_len
+#   [3..5] l3_len (u16)
+#   [5]    l4_len
+#   [6..8] max_tcp_segment_size (u16)
+#   [8..12] total_len (u32)
+#   Per segment: [4 bytes] seg_len (u32)
+
+# -- segment_count (byte 0) --
+seg_1="\x01"
+seg_2="\x02"
+seg_3="\x03"
+seg_10="\x0a"
+seg_31="\x1f"
+seg_32="\x20"
+seg_33="\x21"
+seg_64="\x40"
+
+# -- TxFlags (byte 1) --
+# bit0=offload_ip_hdr_csum, bit1=offload_tcp_csum, bit2=offload_udp_csum
+# bit3=offload_tcp_segmentation, bit4=is_ipv4, bit5=is_ipv6
+flags_none="\x00"
+flags_ipv4="\x10"
+flags_ipv6="\x20"
+flags_ipv4_tcp_csum="\x12"
+flags_ipv4_udp_csum="\x14"
+flags_ipv4_ip_csum="\x11"
+flags_lso_ipv4="\x1b"
+flags_lso_ipv6="\x2b"
+flags_all="\x3f"
+
+# -- l2_len (byte 2) -- Ethernet header
+l2_14="\x0e"
+l2_0="\x00"
+l2_ff="\xff"
+
+# -- l3_len (bytes 3-4, LE u16) -- IP header
+l3_20="\x14\x00"
+l3_40="\x28\x00"
+l3_0="\x00\x00"
+l3_ffff="\xff\xff"
+
+# -- l4_len (byte 5) -- TCP header
+l4_20="\x14"
+l4_0="\x00"
+l4_ff="\xff"
+
+# -- max_tcp_segment_size (bytes 6-7, LE u16) --
+mss_0="\x00\x00"
+mss_536="\x18\x02"
+mss_1460="\xb4\x05"
+mss_ffff="\xff\xff"
+
+# -- total_len (bytes 8-11, LE u32) --
+len_0="\x00\x00\x00\x00"
+len_64="\x40\x00\x00\x00"
+len_128="\x80\x00\x00\x00"
+len_256="\x00\x01\x00\x00"
+len_512="\x00\x02\x00\x00"
+len_1500="\xdc\x05\x00\x00"
+len_1514="\xea\x05\x00\x00"
+len_4096="\x00\x10\x00\x00"
+len_9000="\x28\x23\x00\x00"
+len_65535="\xff\xff\x00\x00"
+len_max="\xff\xff\xff\xff"
+
+# -- segment lengths (per-segment LE u32) --
+slen_0="\x00\x00\x00\x00"
+slen_14="\x0e\x00\x00\x00"
+slen_54="\x36\x00\x00\x00"
+slen_60="\x3c\x00\x00\x00"
+slen_64="\x40\x00\x00\x00"
+slen_128="\x80\x00\x00\x00"
+slen_256="\x00\x01\x00\x00"
+slen_512="\x00\x02\x00\x00"
+slen_1500="\xdc\x05\x00\x00"
+slen_4096="\x00\x10\x00\x00"
+slen_max="\xff\xff\xff\xff"
+
+# -- Full packet templates (16 bytes = 12 header + 4 seg_len) --
+# 1 segment, no flags, l2=14, l3=20, l4=20, mss=0, total=128, seg=128
+simple_128="\x01\x00\x0e\x14\x00\x14\x00\x00\x80\x00\x00\x00\x80\x00\x00\x00"
+# 1 segment, ipv4+tcp_csum, l2=14, l3=20, l4=20, mss=0, total=1500, seg=1500
+tcp_1500="\x01\x12\x0e\x14\x00\x14\x00\x00\xdc\x05\x00\x00\xdc\x05\x00\x00"
+# 1 segment, LSO ipv4, l2=14, l3=20, l4=20, mss=1460, total=9000, seg=9000
+lso_9000="\x01\x1b\x0e\x14\x00\x14\xb4\x05\x28\x23\x00\x00\x28\x23\x00\x00"
+# 2 segments, LSO ipv4, header split: seg0=54(header), seg1=8946
+lso_split="\x02\x1b\x0e\x14\x00\x14\xb4\x05\x28\x23\x00\x00\x36\x00\x00\x00\xf2\x22\x00\x00"
+
+# -- IPV4_HEADER_LENGTH = 14+20+20 = 54 --
+hdr_len_54="\x36\x00\x00\x00"
+
+# PAGE_SIZE = 4096
+page_size="\x00\x10\x00\x00"
