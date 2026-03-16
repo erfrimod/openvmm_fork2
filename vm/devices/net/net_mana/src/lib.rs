@@ -678,6 +678,13 @@ pub const MAX_RWQE_SIZE: u32 = 256;
 /// SWQEs cannot be larger than 512 bytes.
 pub const MAX_SWQE_SIZE: u32 = 512;
 
+/// Maximum total packet length accepted by `handle_tx`. This is a
+/// defense-in-depth guard against untrusted guest input; the upstream
+/// protocol (netvsp) is responsible for enforcing tighter limits.
+/// 1 MB is far beyond any real packet (including LSO) and prevents
+/// multi-GB allocations from reaching the device.
+const MAX_TX_PACKET_SIZE: u32 = 1024 * 1024;
+
 impl<T: DeviceBacking> ManaQueue<T> {
     fn push_rqe(&mut self) -> bool {
         // Make sure there is enough room for an entry of the maximum size. This
@@ -1119,6 +1126,33 @@ impl<T: DeviceBacking> ManaQueue<T> {
             unreachable!()
         };
 
+        // Reject packets whose declared total length is unreasonably large.
+        // This prevents multi-GB allocations when the GDMA device reads
+        // packet data via the SGE sizes derived from the guest-provided
+        // segment lengths.
+        if meta.len > MAX_TX_PACKET_SIZE {
+            tracelimit::warn_ratelimited!(
+                meta.len,
+                MAX_TX_PACKET_SIZE,
+                "dropping tx packet: total length exceeds maximum"
+            );
+            return Ok(None);
+        }
+
+        // Validate that no individual segment length exceeds the declared
+        // total packet length. A mismatch here indicates malformed guest
+        // input and would cause oversized DMA reads in the device.
+        for seg in segments {
+            if seg.len > meta.len {
+                tracelimit::warn_ratelimited!(
+                    seg.len,
+                    meta.len,
+                    "dropping tx packet: segment length exceeds total packet length"
+                );
+                return Ok(None);
+            }
+        }
+
         let mut oob = ManaTxOob::new_zeroed();
         oob.s_oob.set_vcq_num(self.tx_cq.id());
         oob.s_oob
@@ -1133,7 +1167,10 @@ impl<T: DeviceBacking> ManaQueue<T> {
         oob.s_oob
             .set_comp_udp_csum(meta.flags.offload_udp_checksum());
         if meta.flags.offload_tcp_checksum() {
-            oob.s_oob.set_trans_off(meta.l2_len as u16 + meta.l3_len);
+            // trans_off is a 10-bit field (max 1023). Clamp the sum of
+            // guest-provided header lengths to avoid a bitfield panic.
+            let trans_off = (meta.l2_len as u16).saturating_add(meta.l3_len).min(0x3FF);
+            oob.s_oob.set_trans_off(trans_off);
         }
         let short_format = self.vp_offset <= 0xff;
         if short_format {
@@ -1151,7 +1188,15 @@ impl<T: DeviceBacking> ManaQueue<T> {
 
         let mut bounce_buffer = self.tx_bounce_buffer.start_allocation();
         if self.rx_bounce_buffer.is_some() {
-            assert!(!meta.flags.offload_tcp_segmentation());
+            // The bounce buffer path does not support TSO. If the guest sends
+            // a packet with TCP segmentation offload in BounceBuffer mode,
+            // drop it rather than panicking.
+            if meta.flags.offload_tcp_segmentation() {
+                tracelimit::warn_ratelimited!(
+                    "dropping tx packet: TSO not supported in bounce buffer mode"
+                );
+                return Ok(None);
+            }
             let mut buf = match bounce_buffer.allocate(meta.len) {
                 Ok(buf) => buf,
                 Err(err) => {
@@ -1167,6 +1212,14 @@ impl<T: DeviceBacking> ManaQueue<T> {
             let mut next = buf.as_slice();
             for seg in segments {
                 let len = seg.len as usize;
+                if len > next.len() {
+                    tracelimit::warn_ratelimited!(
+                        seg_len = len,
+                        remaining = next.len(),
+                        "dropping tx packet: segment data exceeds bounce buffer allocation"
+                    );
+                    return Ok(None);
+                }
                 self.guest_memory.read_to_atomic(seg.gpa, &next[..len])?;
                 next = &next[len..];
             }
@@ -1190,7 +1243,10 @@ impl<T: DeviceBacking> ManaQueue<T> {
                     return Ok(None);
                 }
                 builder.set_client_oob_in_sgl(header_len as u8);
-                builder.set_gd_client_unit_data(meta.max_tcp_segment_size);
+                // gd_client_unit_data is a 14-bit field (max 16383).
+                // Clamp the guest-provided MSS to fit; the hardware will
+                // enforce the actual MTU independently.
+                builder.set_gd_client_unit_data(meta.max_tcp_segment_size.min(0x3FFF));
 
                 let (head_iova, used_segments, used_segments_len) =
                     if header_len > head.len || self.force_tx_header_bounce {
@@ -1232,9 +1288,15 @@ impl<T: DeviceBacking> ManaQueue<T> {
                         let ContiguousBufferInUse { gpa, .. } = copy.reserve();
                         (gpa, used_segments, used_segments_len)
                     } else if header_len < head.len {
-                        (self.guest_memory.iova(head.gpa).unwrap(), 0, 0)
+                        let Some(iova) = self.guest_memory.iova(head.gpa) else {
+                            return Ok(None);
+                        };
+                        (iova, 0, 0)
                     } else {
-                        (self.guest_memory.iova(head.gpa).unwrap(), 1, header_len)
+                        let Some(iova) = self.guest_memory.iova(head.gpa) else {
+                            return Ok(None);
+                        };
+                        (iova, 1, header_len)
                     };
 
                 // Drop the LSO packet if it only has a header segment.
@@ -1269,11 +1331,14 @@ impl<T: DeviceBacking> ManaQueue<T> {
             if segment_count <= hardware_segment_limit {
                 let mut segment_offset = segment_offset;
                 for tail in segments {
+                    let Some(addr) = self
+                        .guest_memory
+                        .iova(tail.gpa.wrapping_add(segment_offset.into()))
+                    else {
+                        return Ok(None);
+                    };
                     builder.push_sge(Sge {
-                        address: self
-                            .guest_memory
-                            .iova(tail.gpa.wrapping_add(segment_offset.into()))
-                            .unwrap(),
+                        address: addr,
                         mem_key: self.mem_key,
                         size: tail.len.wrapping_sub(segment_offset),
                     });
@@ -1281,8 +1346,11 @@ impl<T: DeviceBacking> ManaQueue<T> {
                 }
             } else {
                 let gpa0 = segments[0].gpa.wrapping_add(segment_offset.into());
+                let Some(addr0) = self.guest_memory.iova(gpa0) else {
+                    return Ok(None);
+                };
                 let mut sge = Sge {
-                    address: self.guest_memory.iova(gpa0).unwrap(),
+                    address: addr0,
                     mem_key: self.mem_key,
                     size: segments[0].len.wrapping_sub(segment_offset),
                 };
@@ -1343,7 +1411,10 @@ impl<T: DeviceBacking> ManaQueue<T> {
                     }
 
                     sge = Sge {
-                        address: self.guest_memory.iova(tail.gpa).unwrap(),
+                        address: match self.guest_memory.iova(tail.gpa) {
+                            Some(addr) => addr,
+                            None => return Ok(None),
+                        },
                         mem_key: self.mem_key,
                         size: tail.len,
                     };
@@ -1427,7 +1498,10 @@ impl<'a> ContiguousBufferManagerTransaction<'a> {
 
     /// Allocates from next section of available ring buffer.
     pub fn allocate<'b>(&'b mut self, len: u32) -> Result<ContiguousBuffer<'b, 'a>, OutOfMemory> {
-        assert!(len < PAGE_SIZE32);
+        if len >= PAGE_SIZE32 {
+            self.parent.failed_allocations += 1;
+            return Err(OutOfMemory);
+        }
         let mut len_with_padding = len;
         let mut allocated_offset = self.head;
         let bytes_remaining_on_page = PAGE_SIZE32 - (self.head & (PAGE_SIZE32 - 1));

@@ -9,15 +9,24 @@
 //! metadata: segment counts, packet lengths, header lengths, LSO flags,
 //! segment coalescing, and bounce buffer logic.
 //!
-//! The fuzz input is parsed as a sequence of packets, each described by
-//! a compact header (12 bytes) plus per-segment lengths (4 bytes each).
+//! The fuzz input is parsed as a sequence of packets. The first byte
+//! selects the DMA mode (DirectDma or BounceBuffer). Each subsequent
+//! packet is described by a 14-byte header plus 2-byte segment lengths.
+//!
+//! ## Coverage design
+//!
+//! - Header lengths (l2/l3/l4) are clamped to realistic ranges so LSO
+//!   packets pass the `header_len <= PAGE_SIZE` check and reach the
+//!   inner header-split, bounce-buffer, and coalescing logic.
+//! - Segment counts range from 1 to 64, covering the >31 segment
+//!   coalescing code path.
+//! - Both DirectDma and BounceBuffer modes are exercised.
 //!
 //! ## Trust boundary
 //!
 //! The guest provides TX segments via netvsp → net_mana. A malicious
-//! guest could provide arbitrary metadata (segment_count, l2/l3/l4_len,
-//! flags, GPAs, lengths). This fuzzer validates that `handle_tx` never
-//! panics or causes memory safety issues regardless of input.
+//! guest could provide arbitrary metadata. This fuzzer validates that
+//! `handle_tx` never panics regardless of input.
 
 #![cfg_attr(all(target_os = "linux", target_env = "gnu"), no_main)]
 
@@ -33,7 +42,7 @@ use net_backend::TxId;
 use net_backend::TxMetadata;
 use net_backend::TxSegment;
 use net_backend::TxSegmentType;
-use net_backend::loopback::LoopbackEndpoint;
+use net_backend::null::NullEndpoint;
 use net_mana::GuestDmaMode;
 use net_mana::ManaEndpoint;
 use pci_core::msi::MsiConnection;
@@ -46,41 +55,55 @@ use vmcore::vm_task::VmTaskDriverSource;
 use xtask_fuzz::fuzz_eprintln;
 use xtask_fuzz::fuzz_target;
 
-/// Minimum bytes to describe one packet: 12 byte header + 4 byte segment len.
-const MIN_PACKET_BYTES: usize = 16;
+/// Header: 1 byte mode + 14 byte packet header + 2 byte segment len.
+const MIN_INPUT_BYTES: usize = 17;
 
-/// Maximum segments per packet (clamped to avoid huge allocations).
+/// Maximum segments per packet.
 const MAX_SEGMENTS: u8 = 64;
 
-/// Parse one fuzzed packet's TxSegments from the input bytes.
+/// Parse one fuzzed packet from the input bytes.
 ///
 /// Packet wire format (little-endian):
-///   [0]    segment_count (1..=MAX_SEGMENTS, clamped)
-///   [1]    flags (TxFlags bits)
-///   [2]    l2_len
-///   [3..5] l3_len (LE u16)
-///   [5]    l4_len
-///   [6..8] max_tcp_segment_size (LE u16)
-///   [8..12] total_len (LE u32)
-///   For each segment (segment_count times):
-///     [4 bytes] segment_len (LE u32)
+///   [0]     segment_count (1..=MAX_SEGMENTS)
+///   [1]     flags (TxFlags bits)
+///   [2]     l2_len_raw — clamped to [0, 64] for realism
+///   [3]     l3_len_raw — clamped to [0, 255] for realism
+///   [4]     l4_len_raw — clamped to [0, 64] for realism
+///   [5..7]  max_tcp_segment_size (LE u16)
+///   [7..9]  total_len_lo (LE u16), used as total_len (capped to 65535)
+///   [9..11] seg_len_base (LE u16) — base segment length for all segments
+///   [11..13] seg_len_fuzz (LE u16) — XOR'd with base for first segment
+///   [13]    extra_flags: bit0 = force_large_total_len
+///   For each segment beyond the first (segment_count - 1 times):
+///     [2 bytes] delta (LE u16) — XOR'd with seg_len_base
 ///
 /// Returns (segments, remaining_input).
 fn parse_packet(input: &[u8], tx_id: u32, guest_mem_size: u64) -> Option<(Vec<TxSegment>, &[u8])> {
-    if input.len() < MIN_PACKET_BYTES {
+    if input.len() < 14 {
         return None;
     }
 
     let segment_count = input[0].max(1).min(MAX_SEGMENTS);
     let flags = TxFlags::from(input[1]);
-    let l2_len = input[2];
-    let l3_len = u16::from_le_bytes([input[3], input[4]]);
-    let l4_len = input[5];
-    let max_tcp_segment_size = u16::from_le_bytes([input[6], input[7]]);
-    let total_len = u32::from_le_bytes([input[8], input[9], input[10], input[11]]);
+    // Clamp header lengths to realistic ranges so LSO path is reachable
+    let l2_len = input[2] & 0x3F; // 0..63 (typ: 14)
+    let l3_len = input[3] as u16; // 0..255 (typ: 20 or 40)
+    let l4_len = input[4] & 0x3F; // 0..63 (typ: 20)
+    let max_tcp_segment_size = u16::from_le_bytes([input[5], input[6]]);
+    let total_len_lo = u16::from_le_bytes([input[7], input[8]]) as u32;
+    let seg_len_base = u16::from_le_bytes([input[9], input[10]]) as u32;
+    let seg_len_fuzz = u16::from_le_bytes([input[11], input[12]]) as u32;
+    let extra_flags = input[13];
 
-    let seg_data_start = 12;
-    let needed = seg_data_start + (segment_count as usize) * 4;
+    // Allow the fuzzer to exercise large (but not OOM-large) packets
+    let total_len = if extra_flags & 1 != 0 {
+        total_len_lo.saturating_mul(16).min(512 * 1024)
+    } else {
+        total_len_lo
+    };
+
+    let per_seg_data_start = 14;
+    let needed = per_seg_data_start + ((segment_count as usize).saturating_sub(1)) * 2;
     if input.len() < needed {
         return None;
     }
@@ -100,9 +123,13 @@ fn parse_packet(input: &[u8], tx_id: u32, guest_mem_size: u64) -> Option<(Vec<Tx
     let mut gpa_offset: u64 = 0;
 
     for i in 0..segment_count as usize {
-        let off = seg_data_start + i * 4;
-        let seg_len =
-            u32::from_le_bytes([input[off], input[off + 1], input[off + 2], input[off + 3]]);
+        let seg_len = if i == 0 {
+            seg_len_base ^ seg_len_fuzz
+        } else {
+            let off = per_seg_data_start + (i - 1) * 2;
+            let delta = u16::from_le_bytes([input[off], input[off + 1]]) as u32;
+            seg_len_base ^ delta
+        };
 
         // Constrain GPA to valid guest memory range.
         let gpa = gpa_offset % guest_mem_size;
@@ -127,14 +154,23 @@ fn parse_packet(input: &[u8], tx_id: u32, guest_mem_size: u64) -> Option<(Vec<Tx
 fn do_fuzz(input: &[u8]) {
     xtask_fuzz::init_tracing_if_repro();
 
-    if input.len() < MIN_PACKET_BYTES {
+    if input.len() < MIN_INPUT_BYTES {
         return;
     }
+
+    // First byte selects DMA mode: even = DirectDma, odd = BounceBuffer
+    let dma_mode = if input[0] & 1 == 0 {
+        GuestDmaMode::DirectDma
+    } else {
+        GuestDmaMode::BounceBuffer
+    };
+    let input = &input[1..];
 
     pal_async::DefaultPool::run_with(async |driver| {
         // -- Deterministic device setup --
         let pages = 512;
-        let mem = DeviceTestMemory::new(pages, true, "fuzz_net_mana_tx_avail");
+        let allow_dma = dma_mode == GuestDmaMode::DirectDma;
+        let mem = DeviceTestMemory::new(pages, allow_dma, "fuzz_net_mana_tx_avail");
         let payload_mem = mem.payload_mem();
         let msi_conn = MsiConnection::new();
         let gdma_device = gdma::GdmaDevice::new(
@@ -143,7 +179,7 @@ fn do_fuzz(input: &[u8]) {
             msi_conn.target(),
             vec![gdma::VportConfig {
                 mac_address: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF].into(),
-                endpoint: Box::new(LoopbackEndpoint::new()),
+                endpoint: Box::new(NullEndpoint::new()),
             }],
             &mut ExternallyManagedMmioIntercepts,
         );
@@ -165,7 +201,7 @@ fn do_fuzz(input: &[u8]) {
         let Ok(vport) = mana_device.new_vport(0, None, &dev_config).await else {
             return;
         };
-        let mut endpoint = ManaEndpoint::new(driver.clone(), vport, GuestDmaMode::DirectDma).await;
+        let mut endpoint = ManaEndpoint::new(driver.clone(), vport, dma_mode).await;
 
         let pool = net_backend::tests::Bufs::new(payload_mem.clone());
         let initial_rx: Vec<RxId> = (1..32).map(RxId).collect();
@@ -188,15 +224,15 @@ fn do_fuzz(input: &[u8]) {
 
         let queue = &mut *queue_vec[0];
 
-        // Guest memory size for GPA clamping.
         let guest_mem_size = (pages as u64) * 4096;
 
         fuzz_eprintln!(
-            "fuzz: setup complete, parsing packets from {} bytes",
+            "fuzz: setup complete, dma_mode={:?}, parsing packets from {} bytes",
+            dma_mode,
             input.len()
         );
 
-        // -- Fuzz loop: parse packets from input and submit them --
+        // -- Fuzz loop --
         let fuzz_result = mesh::CancelContext::new()
             .with_timeout(Duration::from_millis(500))
             .until_cancelled(async {
@@ -204,7 +240,7 @@ fn do_fuzz(input: &[u8]) {
                 let mut tx_id = 1u32;
                 let mut tx_done = vec![TxId(0); 64];
 
-                while remaining.len() >= MIN_PACKET_BYTES {
+                while remaining.len() >= 14 {
                     let Some((segments, rest)) = parse_packet(remaining, tx_id, guest_mem_size)
                     else {
                         break;
@@ -212,24 +248,10 @@ fn do_fuzz(input: &[u8]) {
                     remaining = rest;
                     tx_id = tx_id.wrapping_add(1);
 
-                    fuzz_eprintln!(
-                        "fuzz: tx_avail with {} segments, flags={:#x}",
-                        segments.len(),
-                        segments
-                            .first()
-                            .map(|s| if let TxSegmentType::Head(m) = &s.ty {
-                                u8::from(m.flags)
-                            } else {
-                                0
-                            })
-                            .unwrap_or(0)
-                    );
-
-                    // Submit the fuzzed packet. Errors are expected and fine.
+                    // Submit the fuzzed packet.
                     let _ = queue.tx_avail(&segments);
 
-                    // Drain completions from the real GDMA emulator path.
-                    // This keeps posted_tx from filling up.
+                    // Drain completions to keep posted_tx from filling up.
                     let _ = mesh::CancelContext::new()
                         .with_timeout(Duration::from_millis(5))
                         .until_cancelled(poll_fn(|cx| queue.poll_ready(cx)))
