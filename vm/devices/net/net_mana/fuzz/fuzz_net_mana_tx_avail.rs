@@ -73,7 +73,11 @@ const MAX_SEGMENTS: u8 = 64;
 ///   [7..9]  total_len_lo (LE u16), used as total_len (capped to 65535)
 ///   [9..11] seg_len_base (LE u16) — base segment length for all segments
 ///   [11..13] seg_len_fuzz (LE u16) — XOR'd with base for first segment
-///   [13]    extra_flags: bit0 = force_large_total_len
+///   [13]    extra_flags:
+///             bit0 = force_large_total_len
+///             bit1 = unconstrained GPAs (10% — normally GPAs are tightly bounded)
+///             bit2 = small packet mode
+///             bit3 = inconsistent seg lengths (10% — normally seg_len = total_len/count)
 ///   For each segment beyond the first (segment_count - 1 times):
 ///     [2 bytes] delta (LE u16) — XOR'd with seg_len_base
 ///
@@ -95,12 +99,31 @@ fn parse_packet(input: &[u8], tx_id: u32, guest_mem_size: u64) -> Option<(Vec<Tx
     let seg_len_fuzz = u16::from_le_bytes([input[11], input[12]]) as u32;
     let extra_flags = input[13];
 
-    // Allow the fuzzer to exercise large (but not OOM-large) packets
+    // Allow the fuzzer to exercise large (but not OOM-large) packets.
+    // In BounceBuffer mode, cap lower to avoid trivial allocate() failures
+    // (the bounce buffer is only a few pages).
     let total_len = if extra_flags & 1 != 0 {
         total_len_lo.saturating_mul(16).min(512 * 1024)
+    } else if extra_flags & 4 != 0 {
+        // Small packet mode: cap to < PAGE_SIZE for bounce buffer coverage
+        total_len_lo.min(4000)
     } else {
         total_len_lo
     };
+
+    // 90% of the time, constrain GPAs to a tighter range so iova() succeeds
+    // and packets reach deeper into handle_tx. 10% of the time, use the full
+    // range to test the iova() failure paths.
+    let gpa_range = if extra_flags & 2 != 0 {
+        guest_mem_size // unconstrained — may fail iova()
+    } else {
+        guest_mem_size / 2 // tightly bounded — iova() will succeed
+    };
+
+    // 90% of the time, make segment lengths consistent with total_len so
+    // packets pass validation and reach the WQE builder. 10% of the time,
+    // use raw fuzzed lengths to test the validation guards.
+    let use_consistent_lengths = extra_flags & 8 == 0;
 
     let per_seg_data_start = 14;
     let needed = per_seg_data_start + ((segment_count as usize).saturating_sub(1)) * 2;
@@ -122,8 +145,22 @@ fn parse_packet(input: &[u8], tx_id: u32, guest_mem_size: u64) -> Option<(Vec<Tx
     let mut segments = Vec::with_capacity(segment_count as usize);
     let mut gpa_offset: u64 = 0;
 
+    // Pre-compute consistent per-segment length
+    let consistent_seg_len = if segment_count > 0 && total_len > 0 {
+        total_len / segment_count as u32
+    } else {
+        0
+    };
+
     for i in 0..segment_count as usize {
-        let seg_len = if i == 0 {
+        let seg_len = if use_consistent_lengths && total_len > 0 {
+            // Last segment gets the remainder to sum exactly to total_len
+            if i == (segment_count as usize) - 1 {
+                total_len - consistent_seg_len * (segment_count as u32 - 1)
+            } else {
+                consistent_seg_len
+            }
+        } else if i == 0 {
             seg_len_base ^ seg_len_fuzz
         } else {
             let off = per_seg_data_start + (i - 1) * 2;
@@ -131,8 +168,8 @@ fn parse_packet(input: &[u8], tx_id: u32, guest_mem_size: u64) -> Option<(Vec<Tx
             seg_len_base ^ delta
         };
 
-        // Constrain GPA to valid guest memory range.
-        let gpa = gpa_offset % guest_mem_size;
+        // Constrain GPA to valid range.
+        let gpa = gpa_offset % gpa_range;
         gpa_offset = gpa_offset.wrapping_add(seg_len as u64);
 
         let ty = if i == 0 {
@@ -180,6 +217,7 @@ fn do_fuzz(input: &[u8]) {
             vec![gdma::VportConfig {
                 mac_address: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF].into(),
                 endpoint: Box::new(NullEndpoint::new()),
+                // bit1 of input[0] selects long OOB format (vp_offset > 0xFF)
             }],
             &mut ExternallyManagedMmioIntercepts,
         );
@@ -241,15 +279,29 @@ fn do_fuzz(input: &[u8]) {
                 let mut tx_done = vec![TxId(0); 64];
 
                 while remaining.len() >= 14 {
-                    let Some((segments, rest)) = parse_packet(remaining, tx_id, guest_mem_size)
-                    else {
+                    // Batch multiple packets into a single tx_avail call
+                    // when they are adjacent in the input. This exercises
+                    // the tx_avail loop that processes multiple Head+Tail
+                    // sequences in one call.
+                    let mut all_segments = Vec::new();
+                    let batch_limit = 4;
+                    let mut batch_count = 0;
+                    while remaining.len() >= 14 && batch_count < batch_limit {
+                        let Some((segments, rest)) = parse_packet(remaining, tx_id, guest_mem_size)
+                        else {
+                            break;
+                        };
+                        remaining = rest;
+                        tx_id = tx_id.wrapping_add(1);
+                        all_segments.extend(segments);
+                        batch_count += 1;
+                    }
+                    if all_segments.is_empty() {
                         break;
-                    };
-                    remaining = rest;
-                    tx_id = tx_id.wrapping_add(1);
+                    }
 
-                    // Submit the fuzzed packet.
-                    let _ = queue.tx_avail(&segments);
+                    // Submit the batch.
+                    let _ = queue.tx_avail(&all_segments);
 
                     // Drain completions to keep posted_tx from filling up.
                     let _ = mesh::CancelContext::new()
