@@ -539,7 +539,7 @@ impl<T: DeviceBacking> Endpoint for ManaEndpoint<T> {
     }
 
     async fn set_data_path_to_guest_vf(&self, use_vf: bool) -> anyhow::Result<()> {
-        self.vport.move_filter(if use_vf { 1 } else { 0 }).await?;
+        self.vport.move_filter(u8::from(use_vf)).await?;
         Ok(())
     }
 
@@ -770,12 +770,9 @@ impl<T: DeviceBacking> ManaQueue<T> {
         let size = header_size + s_oob_size;
         let bytes = self.tx_wq.read(wqe_offset, size);
         let wqe_header = WqeHeader::read_from_prefix(&bytes);
-        let wqe_header = match wqe_header {
-            Ok((wqe_header, _)) => wqe_header,
-            Err(_) => {
-                tracelimit::error_ratelimited!(size, wqe_offset, "failed to read tx WQE header");
-                return;
-            }
+        let Ok((wqe_header, _)) = wqe_header else {
+            tracelimit::error_ratelimited!(size, wqe_offset, "failed to read tx WQE header");
+            return;
         };
 
         tracelimit::event_ratelimited!(
@@ -821,12 +818,9 @@ impl<T: DeviceBacking> ManaQueue<T> {
         let size = size_of::<WqeHeader>();
         let bytes = self.rx_wq.read(wqe_offset, size);
         let wqe_header = WqeHeader::read_from_prefix(&bytes);
-        let wqe_header = match wqe_header {
-            Ok((wqe_header, _)) => wqe_header,
-            Err(_) => {
-                tracelimit::error_ratelimited!(size, wqe_offset, "failed to parse rx WQE header");
-                return;
-            }
+        let Ok((wqe_header, _)) = wqe_header else {
+            tracelimit::error_ratelimited!(size, wqe_offset, "failed to parse rx WQE header");
+            return;
         };
 
         tracelimit::error_ratelimited!(
@@ -883,7 +877,7 @@ impl<T: DeviceBacking + Send> Queue for ManaQueue<T> {
                         }
                     }
                     ty => {
-                        tracing::error!(ty, "unknown completion type")
+                        tracing::error!(ty, "unknown completion type");
                     }
                 }
             }
@@ -1194,15 +1188,15 @@ impl<T: DeviceBacking> ManaQueue<T> {
             let (segments, segment_offset) = if meta.flags.offload_tcp_segmentation() {
                 // For LSO, GDMA requires that SGE0 should only contain the header.
                 let header_len = (meta.l2_len as u16 + meta.l3_len + meta.l4_len as u16) as u32;
-                if header_len > PAGE_SIZE32 {
+                let Some(header_len_u8) = u8::try_from(header_len).ok() else {
                     tracelimit::error_ratelimited!(
                         header_len,
-                        "Header larger than PAGE_SIZE unsupported"
+                        "Header larger than u8::MAX unsupported"
                     );
                     // Drop the packet
                     return Ok(None);
-                }
-                builder.set_client_oob_in_sgl(header_len as u8);
+                };
+                builder.set_client_oob_in_sgl(header_len_u8);
                 builder.set_gd_client_unit_data(meta.max_tcp_segment_size);
 
                 let (head_iova, used_segments, used_segments_len) =
@@ -1241,7 +1235,7 @@ impl<T: DeviceBacking> ManaQueue<T> {
                             );
                             // Drop the packet
                             return Ok(None);
-                        };
+                        }
                         let ContiguousBufferInUse { gpa, .. } = copy.reserve();
                         (gpa, used_segments, used_segments_len)
                     } else if header_len < head.len {
@@ -1361,7 +1355,7 @@ impl<T: DeviceBacking> ManaQueue<T> {
                 }
                 builder.push_sge(sge);
                 self.stats.tx_packets_coalesced.increment();
-            };
+            }
 
             assert!(builder.sge_count() <= hardware_segment_limit);
         }

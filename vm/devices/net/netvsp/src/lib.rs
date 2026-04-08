@@ -1286,7 +1286,7 @@ impl VmbusDevice for Nic {
         if channel_idx != 0
             && num_opened + 1 == self.coordinator.state_mut().unwrap().num_queues as usize
         {
-            let coordinator = &mut self.coordinator.state_mut().unwrap();
+            let coordinator = &mut *self.coordinator.state_mut().unwrap();
             coordinator.workers[0].stop().await;
         }
 
@@ -1521,8 +1521,7 @@ impl Nic {
                 buffers: None,
                 num_queues,
                 active_packet_filter: restoring
-                    .map(|r| r.active_packet_filter)
-                    .unwrap_or(rndisprot::NDIS_PACKET_TYPE_NONE),
+                    .map_or(rndisprot::NDIS_PACKET_TYPE_NONE, |r| r.active_packet_filter),
                 sleep_deadline: None,
             },
         );
@@ -1564,10 +1563,9 @@ impl Nic {
         let mut saved_packet_filter = 0u32;
         if let Some(state) = state.open {
             let open = match &state.primary {
-                saved_state::Primary::Version => vec![true],
-                saved_state::Primary::Init(_) => vec![true],
+                saved_state::Primary::Version | saved_state::Primary::Init(_) => vec![true],
                 saved_state::Primary::Ready(ready) => {
-                    ready.channels.iter().map(|x| x.is_some()).collect()
+                    ready.channels.iter().map(Option::is_some).collect()
                 }
             };
 
@@ -1689,9 +1687,7 @@ impl Nic {
                     });
 
                     for (channel_idx, channel) in channels.iter().enumerate() {
-                        let channel = if let Some(channel) = channel {
-                            channel
-                        } else {
+                        let Some(channel) = channel else {
                             continue;
                         };
 
@@ -1765,7 +1761,7 @@ impl Nic {
                         ndis_version: init.ndis_version.map(|NdisVersion { major, minor }| {
                             saved_state::NdisVersion { major, minor }
                         }),
-                        receive_buffer: init.recv_buffer.as_ref().map(|x| x.saved_state()),
+                        receive_buffer: init.recv_buffer.as_ref().map(ReceiveBuffer::saved_state),
                         send_buffer: init.send_buffer.as_ref().map(|x| saved_state::SendBuffer {
                             gpadl_id: x.gpadl.id(),
                         }),
@@ -2591,7 +2587,7 @@ impl<T: RingMem> NetChannel<T> {
         }
 
         let start = segments.len();
-        for range in data.paged_ranges().flat_map(|r| r.ranges()) {
+        for range in data.paged_ranges().flat_map(PagedRange::ranges) {
             let range = range.map_err(WorkerError::InvalidGpadl)?;
             segments.push(TxSegment {
                 ty: net_backend::TxSegmentType::Tail,
@@ -2635,7 +2631,7 @@ impl<T: RingMem> NetChannel<T> {
                 self.message(
                     protocol::MESSAGE4_TYPE_SEND_VF_ASSOCIATION,
                     protocol::Message4SendVfAssociation {
-                        vf_allocated: if serial_number.is_some() { 1 } else { 0 },
+                        vf_allocated: u32::from(serial_number.is_some()),
                         serial_number: serial_number.unwrap_or(0),
                     },
                 )
@@ -4190,9 +4186,8 @@ impl Coordinator {
     }
 
     async fn restore_guest_vf_state(&mut self, c_state: &mut CoordinatorState) {
-        let primary = match self.primary_mut() {
-            Some(primary) => primary,
-            None => return,
+        let Some(primary) = self.primary_mut() else {
+            return;
         };
 
         // Update guest VF state based on current endpoint properties.
@@ -4219,14 +4214,12 @@ impl Coordinator {
                 PrimaryChannelGuestVfState::UnavailableFromDataPathSwitchPending { .. }
                 | PrimaryChannelGuestVfState::UnavailableFromDataPathSwitched
                 | PrimaryChannelGuestVfState::Ready
-                | PrimaryChannelGuestVfState::Restoring(saved_state::GuestVfState::Ready)
                 | PrimaryChannelGuestVfState::DataPathSwitchPending { .. }
-                | PrimaryChannelGuestVfState::Restoring(
-                    saved_state::GuestVfState::DataPathSwitchPending { .. },
-                )
                 | PrimaryChannelGuestVfState::DataPathSwitched
                 | PrimaryChannelGuestVfState::Restoring(
-                    saved_state::GuestVfState::DataPathSwitched,
+                    saved_state::GuestVfState::Ready
+                    | saved_state::GuestVfState::DataPathSwitchPending { .. }
+                    | saved_state::GuestVfState::DataPathSwitched,
                 )
                 | PrimaryChannelGuestVfState::DataPathSynthetic => {
                     c_state.pending_vf_state = CoordinatorStatePendingVfState::Pending;
@@ -4381,13 +4374,11 @@ impl Coordinator {
                     PrimaryChannelGuestVfState::Unavailable
                 }
                 PrimaryChannelGuestVfState::AvailableAdvertised
-                | PrimaryChannelGuestVfState::Restoring(
-                    saved_state::GuestVfState::AvailableAdvertised,
-                )
                 | PrimaryChannelGuestVfState::Ready
-                | PrimaryChannelGuestVfState::Restoring(saved_state::GuestVfState::Ready) => {
-                    PrimaryChannelGuestVfState::UnavailableFromAvailable
-                }
+                | PrimaryChannelGuestVfState::Restoring(
+                    saved_state::GuestVfState::AvailableAdvertised
+                    | saved_state::GuestVfState::Ready,
+                ) => PrimaryChannelGuestVfState::UnavailableFromAvailable,
                 PrimaryChannelGuestVfState::DataPathSwitchPending { to_guest, id, .. }
                 | PrimaryChannelGuestVfState::Restoring(
                     saved_state::GuestVfState::DataPathSwitchPending { to_guest, id, .. },
@@ -4421,10 +4412,7 @@ impl Coordinator {
 
         c_state.endpoint.stop().await;
 
-        let (primary_worker, subworkers) = if let [primary, sub @ ..] = self.workers.as_mut_slice()
-        {
-            (primary, sub)
-        } else {
+        let [primary_worker, subworkers @ ..] = self.workers.as_mut_slice() else {
             unreachable!()
         };
 
@@ -4432,9 +4420,7 @@ impl Coordinator {
             .state_mut()
             .and_then(|worker| worker.state.ready_mut());
 
-        let state = if let Some(state) = state {
-            state
-        } else {
+        let Some(state) = state else {
             return Ok(());
         };
 
@@ -4447,7 +4433,7 @@ impl Coordinator {
             if let Some(rss_state) = state.state.primary.as_ref().unwrap().rss_state.as_ref() {
                 // Active queue count is computed as the number of unique entries in the indirection table
                 active_queues.clone_from(&rss_state.indirection_table);
-                active_queues.sort();
+                active_queues.sort_unstable();
                 active_queues.dedup();
                 active_queues = active_queues
                     .into_iter()
@@ -5102,7 +5088,7 @@ impl<T: 'static + RingMem> NetChannel<T> {
                         ));
                     }
                     PendingLinkAction::Active(_) => panic!("State should not be Active"),
-                    _ => {}
+                    PendingLinkAction::Default => {}
                 }
             }
             match primary.guest_vf_state {
@@ -5427,13 +5413,12 @@ impl<T: 'static + RingMem> NetChannel<T> {
             if state.free_tx_packets.is_empty() {
                 break;
             }
-            let packet = if let Some(packet) = self.try_next_packet(
+            let Some(packet) = self.try_next_packet(
                 buffers.send_buffer.as_ref(),
                 Some(buffers.version),
                 &mut data.external_data,
-            )? {
-                packet
-            } else {
+            )?
+            else {
                 break;
             };
 

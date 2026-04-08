@@ -295,18 +295,16 @@ impl net_backend::Endpoint for TestNicEndpoint {
             if locked_data
                 .vf_state
                 .as_ref()
-                .is_none_or(|vf_state| vf_state.is_ready())
+                .is_none_or(TestVirtualFunctionState::is_ready)
             {
                 locked_data.use_vf = Some(use_vf);
                 locked_data.last_use_vf = Some(use_vf);
                 locked_data.poll_iterations_required
+            } else if use_vf {
+                anyhow::bail!("VF not ready");
             } else {
-                if use_vf {
-                    anyhow::bail!("VF not ready");
-                } else {
-                    // VF not available, but switching away from using it.
-                    return Ok(());
-                }
+                // VF not available, but switching away from using it.
+                return Ok(());
             }
         };
         std::future::poll_fn(move |cx| {
@@ -994,7 +992,7 @@ impl<'a> TestNicChannel<'a> {
                         transaction_id = data.transaction_id();
                         Some(parser.get(&external_ranges))
                     }
-                    _ => panic!("Unexpected packet!"),
+                    IncomingPacket::Completion(_) => panic!("Unexpected packet!"),
                 }
             })
             .await
@@ -1050,7 +1048,7 @@ impl<'a> TestNicChannel<'a> {
                     reader.read_plain().unwrap();
                 Some(completion_data)
             }
-            _ => panic!("Unexpected packet!"),
+            IncomingPacket::Data(_) => panic!("Unexpected packet!"),
         })
         .await
         .unwrap_or(None)
@@ -1813,9 +1811,8 @@ fn make_test_guest_rings(
     ring_offset: u32,
 ) -> (IncomingRing<GpadlRingMem>, OutgoingRing<GpadlRingMem>) {
     let gpadl = AlignedGpadlView::new(gpadl_map.map(gpadl_id).unwrap()).unwrap();
-    let (out_gpadl, in_gpadl) = match gpadl.split(ring_offset) {
-        Ok(gpadls) => gpadls,
-        Err(_) => panic!("Failed gpadl.split"),
+    let Ok((out_gpadl, in_gpadl)) = gpadl.split(ring_offset) else {
+        panic!("Failed gpadl.split")
     };
     (
         IncomingRing::new(GpadlRingMem::new(in_gpadl, mem).unwrap()).unwrap(),

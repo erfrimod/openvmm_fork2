@@ -200,7 +200,7 @@ async fn try_create_mana_device(
                 pci_id
             ))
             .await
-            .with_context(|| format!("failed to restore vfio device for {}", pci_id))?
+            .with_context(|| format!("failed to restore vfio device for {pci_id}"))?
     } else {
         VfioDevice::new(driver_source, pci_id, dma_clients)
             .instrument(tracing::info_span!(
@@ -209,7 +209,7 @@ async fn try_create_mana_device(
                 pci_id
             ))
             .await
-            .with_context(|| format!("failed to open vfio device for {}", pci_id))?
+            .with_context(|| format!("failed to open vfio device for {pci_id}"))?
     };
 
     tracing::info!(vtl2_vfid, pci_id, "Creating MANA device");
@@ -343,13 +343,9 @@ impl HclNetworkVFManagerWorker {
     ) -> (Self, mesh::Sender<HclNetworkVfManagerMessage>) {
         let (tx_to_worker, worker_rx) = mesh::channel();
         let vtl0_bus_control = if save_state.hidden_vtl0.lock().unwrap_or(false) {
-            vtl0_bus_control
-                .map(Vtl0Bus::HiddenPresent)
-                .unwrap_or(Vtl0Bus::HiddenNotPresent)
+            vtl0_bus_control.map_or(Vtl0Bus::HiddenNotPresent, Vtl0Bus::HiddenPresent)
         } else {
-            vtl0_bus_control
-                .map(Vtl0Bus::Present)
-                .unwrap_or(Vtl0Bus::NotPresent)
+            vtl0_bus_control.map_or(Vtl0Bus::NotPresent, Vtl0Bus::Present)
         };
         (
             Self {
