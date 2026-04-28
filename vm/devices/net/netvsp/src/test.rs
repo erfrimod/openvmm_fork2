@@ -145,6 +145,11 @@ struct TestNicEndpointState {
     /// TX packets are completed synchronously.  When false it returns
     /// `(false, N)`, leaving packets in-flight.
     pub sync_tx: bool,
+    /// If `Some((idx, notifier))`, the next call to `TestNicQueue::tx_poll`
+    /// for the queue with index `idx` returns `TxError::TryRestart`.
+    /// Consumed on use, so the error fires only once. If `notifier` is
+    /// `Some`, it is signaled.
+    pub inject_tx_error_for_queue: Option<(usize, Option<mesh::OneshotSender<()>>)>,
 }
 
 impl TestNicEndpointState {
@@ -158,6 +163,7 @@ impl TestNicEndpointState {
             link_status_updater: None,
             queues: Vec::new(),
             sync_tx: true,
+            inject_tx_error_for_queue: None,
         }))
     }
 
@@ -242,9 +248,16 @@ impl net_backend::Endpoint for TestNicEndpoint {
             .is_none_or(|s| s.lock().sync_tx);
         let senders = config
             .into_iter()
-            .map(|config| {
+            .enumerate()
+            .map(|(queue_idx, config)| {
                 let (tx, rx) = mesh::channel();
-                queues.push(Box::new(TestNicQueue::new(config, rx, sync_tx)));
+                queues.push(Box::new(TestNicQueue::new(
+                    config,
+                    rx,
+                    sync_tx,
+                    queue_idx,
+                    inner.endpoint_state.clone(),
+                )));
                 tx
             })
             .collect::<Vec<_>>();
@@ -341,16 +354,27 @@ struct TestNicQueue {
     sync_tx: bool,
     #[inspect(skip)]
     scratch_segments: Vec<RxBufferSegment>,
+    queue_idx: usize,
+    #[inspect(skip)]
+    endpoint_state: Option<Arc<parking_lot::Mutex<TestNicEndpointState>>>,
 }
 
 impl TestNicQueue {
-    pub fn new(_config: QueueConfig, rx: mesh::Receiver<Vec<u8>>, sync_tx: bool) -> Self {
+    pub fn new(
+        _config: QueueConfig,
+        rx: mesh::Receiver<Vec<u8>>,
+        sync_tx: bool,
+        queue_idx: usize,
+        endpoint_state: Option<Arc<parking_lot::Mutex<TestNicEndpointState>>>,
+    ) -> Self {
         Self {
             rx_ids: VecDeque::new(),
             rx,
             next_rx_packet: None,
             sync_tx,
             scratch_segments: Vec::new(),
+            queue_idx,
+            endpoint_state,
         }
     }
 }
@@ -435,6 +459,23 @@ impl NetQueue for TestNicQueue {
         _pool: &mut dyn BufferAccess,
         _done: &mut [TxId],
     ) -> Result<usize, TxError> {
+        if let Some(state) = &self.endpoint_state {
+            let mut locked = state.lock();
+            let matches = matches!(
+                &locked.inject_tx_error_for_queue,
+                Some((idx, _)) if *idx == self.queue_idx,
+            );
+            if matches {
+                let (_, notifier) = locked.inject_tx_error_for_queue.take().unwrap();
+                drop(locked);
+                if let Some(notifier) = notifier {
+                    notifier.send(());
+                }
+                return Err(TxError::TryRestart(anyhow::anyhow!(
+                    "simulated CQE_TX_GDMA_ERR"
+                )));
+            }
+        }
         Ok(0)
     }
 }
@@ -6174,4 +6215,204 @@ async fn subchannel_request_equal_to_max_queues_rejected(driver: DefaultDriver) 
         })
         .await
         .expect("completion message");
+}
+
+/// This inject a `TryRestart` on sub-channel 1, and confirms that no panic is raised
+/// and the primary channel remains responsive.
+#[async_test]
+async fn subchannel_try_restart_error_recovers(driver: DefaultDriver) {
+    const TOTAL_QUEUES: u32 = 4;
+    let endpoint_state = TestNicEndpointState::new();
+    let endpoint = TestNicEndpoint::new(Some(endpoint_state.clone()));
+    let test_vf = Box::new(TestVirtualFunction::new(Some(123)));
+    let builder = Nic::builder();
+    let nic = builder.virtual_function(test_vf).build(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        Guid::new_random(),
+        Box::new(endpoint),
+        [1, 2, 3, 4, 5, 6].into(),
+        0,
+    );
+
+    let mut nic = TestNicDevice::new_with_nic(&driver, nic).await;
+    nic.start_vmbus_channel();
+    let mut channel = nic.connect_vmbus_channel().await;
+    channel
+        .initialize(
+            TOTAL_QUEUES as usize - 1,
+            protocol::NdisConfigCapabilities::new().with_sriov(true),
+        )
+        .await;
+
+    // RNDIS Initialize.
+    channel
+        .send_rndis_control_message(
+            rndisprot::MESSAGE_TYPE_INITIALIZE_MSG,
+            rndisprot::InitializeRequest {
+                request_id: 1,
+                major_version: rndisprot::MAJOR_VERSION,
+                minor_version: rndisprot::MINOR_VERSION,
+                max_transfer_size: 0,
+            },
+            &[],
+        )
+        .await;
+    let _: rndisprot::InitializeComplete = channel
+        .read_rndis_control_message(rndisprot::MESSAGE_TYPE_INITIALIZE_CMPLT)
+        .await
+        .unwrap();
+
+    // Skip association packet.
+    channel
+        .read_with(|packet| match packet {
+            IncomingPacket::Data(_) => (),
+            _ => panic!("Unexpected packet"),
+        })
+        .await
+        .expect("association packet");
+
+    // Allocate sub-channels.
+    let message = NvspMessage {
+        header: protocol::MessageHeader {
+            message_type: protocol::MESSAGE5_TYPE_SUB_CHANNEL,
+        },
+        data: protocol::Message5SubchannelRequest {
+            operation: protocol::SubchannelOperation::ALLOCATE,
+            num_sub_channels: TOTAL_QUEUES - 1,
+        },
+        padding: &[],
+    };
+    channel
+        .write(OutgoingPacket {
+            transaction_id: 1,
+            packet_type: OutgoingPacketType::InBandWithCompletion,
+            payload: &message.payload(),
+        })
+        .await;
+    channel
+        .read_with(|packet| match packet {
+            IncomingPacket::Completion(completion) => {
+                let mut reader = completion.reader();
+                let header: protocol::MessageHeader = reader.read_plain().unwrap();
+                assert_eq!(header.message_type, protocol::MESSAGE5_TYPE_SUB_CHANNEL);
+                let completion_data: protocol::Message5SubchannelComplete =
+                    reader.read_plain().unwrap();
+                assert_eq!(completion_data.status, protocol::Status::SUCCESS);
+            }
+            _ => panic!("Unexpected packet"),
+        })
+        .await
+        .expect("subchannel allocate completion");
+
+    for idx in 1..TOTAL_QUEUES {
+        channel.connect_subchannel(idx).await;
+    }
+
+    // Drain the indirection table message and complete it so the worker
+    // continues.
+    let transaction_id = channel
+        .read_with(|packet| match packet {
+            IncomingPacket::Data(packet) => {
+                let mut reader = packet.reader();
+                let header: protocol::MessageHeader = reader.read_plain().unwrap();
+                assert_eq!(
+                    header.message_type,
+                    protocol::MESSAGE5_TYPE_SEND_INDIRECTION_TABLE
+                );
+                packet.transaction_id()
+            }
+            _ => panic!("Unexpected packet"),
+        })
+        .await
+        .expect("indirection table");
+    if let Some(transaction_id) = transaction_id {
+        channel
+            .write(OutgoingPacket {
+                transaction_id,
+                packet_type: OutgoingPacketType::Completion,
+                payload: &NvspMessage {
+                    header: protocol::MessageHeader {
+                        message_type: protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET_COMPLETE,
+                    },
+                    data: protocol::Message1SendRndisPacketComplete {
+                        status: protocol::Status::SUCCESS,
+                    },
+                    padding: &[],
+                }
+                .payload(),
+            })
+            .await;
+    }
+
+    // Set the packet filter so all sub-channels become active and start
+    // running their `main_loop` (which calls `tx_poll`).
+    let request_id = 7;
+    channel
+        .send_rndis_control_message(
+            rndisprot::MESSAGE_TYPE_SET_MSG,
+            rndisprot::SetRequest {
+                request_id,
+                oid: rndisprot::Oid::OID_GEN_CURRENT_PACKET_FILTER,
+                information_buffer_length: size_of::<u32>() as u32,
+                information_buffer_offset: size_of::<rndisprot::SetRequest>() as u32,
+                device_vc_handle: 0,
+            },
+            &rndisprot::NPROTO_PACKET_FILTER.to_le_bytes(),
+        )
+        .await;
+    let set_complete: rndisprot::SetComplete = channel
+        .read_rndis_control_message(rndisprot::MESSAGE_TYPE_SET_CMPLT)
+        .await
+        .unwrap();
+    assert_eq!(set_complete.request_id, request_id);
+    assert_eq!(set_complete.status, rndisprot::STATUS_SUCCESS);
+
+    // Snapshot the endpoint stop counter before the injection.
+    let stop_count_before_injection = endpoint_state.lock().stop_endpoint_counter;
+
+    // Arm the GDMA-error injection on sub-channel 1.
+    let (consumed_tx, consumed_rx) = mesh::oneshot();
+    endpoint_state.lock().inject_tx_error_for_queue = Some((1, Some(consumed_tx)));
+    {
+        let locked_state = endpoint_state.lock();
+        locked_state.queues[1].send(vec![1u8]);
+    }
+
+    // Wait for the sub-channel to take the injected error path.
+    mesh::CancelContext::new()
+        .with_timeout(Duration::from_secs(5))
+        .until_cancelled(consumed_rx)
+        .await
+        .expect("sub-channel did not consume injected TryRestart error")
+        .expect("injection notifier dropped without firing");
+
+    // Issue an RNDIS query and verify we get a successful completion back.
+    let request_id = 11;
+    channel
+        .send_rndis_control_message(
+            rndisprot::MESSAGE_TYPE_QUERY_MSG,
+            rndisprot::QueryRequest {
+                request_id,
+                oid: rndisprot::Oid::OID_GEN_LINK_SPEED,
+                information_buffer_length: 0,
+                information_buffer_offset: 0,
+                device_vc_handle: 0,
+            },
+            &[],
+        )
+        .await;
+    let query_complete: rndisprot::QueryComplete = channel
+        .read_rndis_control_message(rndisprot::MESSAGE_TYPE_QUERY_CMPLT)
+        .await
+        .unwrap();
+    assert_eq!(query_complete.request_id, request_id);
+    assert_eq!(query_complete.status, rndisprot::STATUS_SUCCESS);
+
+    // `TryRestart` triggers a device-wide `restart_queues()` which
+    // calls `endpoint.stop()`.
+    let stop_count_after = endpoint_state.lock().stop_endpoint_counter;
+    assert!(
+        stop_count_after > stop_count_before_injection,
+        "endpoint.stop() should have been called during the TryRestart recovery cycle",
+    );
 }

@@ -4750,6 +4750,7 @@ impl<T: RingMem + 'static> Worker<T> {
                         Err(WorkerError::EndpointRequiresQueueRestart(err)) => {
                             tracelimit::warn_ratelimited!(
                                 err = err.as_ref() as &dyn std::error::Error,
+                                channel_idx = self.channel_idx,
                                 "Endpoint requires queues to restart",
                             );
                             CoordinatorMessage::Restart
@@ -4757,16 +4758,20 @@ impl<T: RingMem + 'static> Worker<T> {
                         Err(err) => return Err(err),
                     };
 
-                    let WorkerState::Ready(ready) = std::mem::replace(
-                        &mut self.state,
-                        WorkerState::WaitingForCoordinator(None),
-                    ) else {
-                        unreachable!("must be running in ready state")
-                    };
-                    let _ = std::mem::replace(
-                        &mut self.state,
-                        WorkerState::WaitingForCoordinator(Some(ready)),
-                    );
+                    // Only the primary channel transitions into WaitingForCoordinator.
+                    // Sub-channels state remains Ready. Restart queues rebuilds state.
+                    if self.channel_idx == 0 {
+                        let WorkerState::Ready(ready) = std::mem::replace(
+                            &mut self.state,
+                            WorkerState::WaitingForCoordinator(None),
+                        ) else {
+                            unreachable!("must be running in ready state")
+                        };
+                        let _ = std::mem::replace(
+                            &mut self.state,
+                            WorkerState::WaitingForCoordinator(Some(ready)),
+                        );
+                    }
                     self.coordinator_send
                         .try_send(msg)
                         .map_err(WorkerError::CoordinatorMessageSendFailed)?;
