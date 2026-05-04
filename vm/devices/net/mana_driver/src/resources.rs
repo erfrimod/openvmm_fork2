@@ -76,7 +76,7 @@ impl ResourceArena {
                     drop(ManuallyDrop::into_inner(mem));
                     Ok(())
                 }
-                // During HWC reset request recovery, skip sending teardown commands for HWC resources.
+                // When an HWC reset request is pending, skip sending teardown commands for HWC resources.
                 // HWC requests will fail and the device reclaims resources on its own reset.
                 Resource::DmaRegion { .. } | Resource::Eq { .. } | Resource::BnicQueue { .. }
                     if skip_hwc =>
