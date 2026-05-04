@@ -1167,7 +1167,12 @@ impl HclNetworkVFManagerWorker {
         self.shutdown_vtl2_device(false).await;
         *vtl2_device_state = Vtl2DeviceState::Missing;
         // If the device is being removed, remove outstanding vf reconfiguration.
-        *vf_reconfig_backoff = None;
+        if vf_reconfig_backoff.take().is_some() {
+            tracing::warn!(
+                vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control),
+                "device removed, abandoning vf reconfiguration"
+            );
+        }
 
         if let Err(err) = self.update_vtl2_device_bind_state(false).await {
             tracing::error!(
@@ -1218,6 +1223,10 @@ impl HclNetworkVFManagerWorker {
                     // Prior behavior treats any uevent with a valid device path as an arrival, as long
                     // as the VTL2 device is currently missing. Otherwise, uevents are silently ignored.
                     // It would be more correct to check that the uevent action is 'add'.
+                    // While Reconfiguring, ignore uevents.
+                    // Rescan events don't reliably indicate device readiness.
+                    // If FHR occurs during Reconfiguring, ManaDeviceRemoved will transition state
+                    // to Missing, allowing the subsequent add uevent to trigger ManaDeviceArrived.
                     let exists = Path::new(&device_path).exists();
                     match (vtl2_device_state, exists) {
                         (Vtl2DeviceState::Missing, true) => NextWorkItem::ManaDeviceArrived,
@@ -1418,7 +1427,7 @@ impl HclNetworkVFManagerWorker {
                     }
                     assert!(
                         vf_reconfig_backoff.is_none(),
-                        "device arrival should only occur after device removal and not vf reconfiguration"
+                        "device arrival should only occur after device removal, not during vf reconfiguration"
                     );
                     self.mana_device_arrived(&mut vtl2_device_state)
                         .instrument(tracing::info_span!("VTL2 VF arrived", vtl2_vfid))
