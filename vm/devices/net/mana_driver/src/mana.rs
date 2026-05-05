@@ -246,8 +246,9 @@ impl<T: DeviceBacking> ManaDevice<T> {
                             }
                         }
                         if gdma.get_reset_request_pending() {
-                            if let Some(sender) =
-                                inner.vf_reset_request_sender.lock().await.as_ref()
+                            // `reset_request_pending` stays true until destruction.
+                            // Take the sender so we only notify once per lifetime.
+                            if let Some(sender) = inner.vf_reset_request_sender.lock().await.take()
                             {
                                 sender.send(());
                             }
