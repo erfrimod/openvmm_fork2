@@ -121,8 +121,9 @@ impl GuestBuffers {
         })
     }
 
-    fn write_at(&self, offset: u32, mut buf: &[u8]) {
+    fn write_at(&self, offset: u32, buf: &[u8]) {
         let mut offset = offset as usize;
+        let mut buf = buf;
         while !buf.is_empty() {
             let len = (PAGE_SIZE - offset % PAGE_SIZE).min(buf.len());
             let (this, next) = buf.split_at(len);
@@ -188,6 +189,18 @@ impl BufferAccess for BufferPool {
     }
 
     fn write_data(&mut self, id: RxId, data: &[u8]) {
+        // `data` is expected to fit within `capacity(id)`. Drop
+        // oversized writes so caller can't corrupt adjacent
+        // suballocations or run off the end of the buffer.
+        if data.len() > self.capacity(id) as usize {
+            tracelimit::warn_ratelimited!(
+                rx_id = id.0,
+                data_len = data.len(),
+                mtu = self.capacity(id),
+                "rx data exceeds capacity, dropping",
+            );
+            return;
+        }
         self.buffers.write_at(self.offset(id) + RX_HEADER_LEN, data);
     }
 
