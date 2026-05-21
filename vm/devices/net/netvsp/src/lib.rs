@@ -2123,6 +2123,16 @@ struct Packet<'a> {
     external_data: &'a MultiPagedRangeBuf,
 }
 
+/// Outcome of [`NetChannel::try_next_packet`].
+enum TryNextPacket<'a> {
+    /// A packet was read and parsed successfully.
+    Packet(Packet<'a>),
+    /// A packet was read but parsing failed.
+    Skipped,
+    /// The ring buffer is empty.
+    Empty,
+}
+
 type PacketReader<'a> = PagedRangesReader<'a, MultiPagedRangeIter<'a>>;
 
 impl Packet<'_> {
@@ -4912,12 +4922,15 @@ impl<T: RingMem + 'static> Worker<T> {
 }
 
 impl<T: 'static + RingMem> NetChannel<T> {
+    /// Attempts to read the next packet from the ring buffer.
+    /// Possible returns are valid packets, malformed packets
+    /// that were skipped, empty ring buffers, or WorkerErrors.
     fn try_next_packet<'a>(
         &mut self,
         send_buffer: Option<&SendBuffer>,
         version: Option<Version>,
         external_data: &'a mut MultiPagedRangeBuf,
-    ) -> Result<Option<Packet<'a>>, WorkerError> {
+    ) -> Result<TryNextPacket<'a>, WorkerError> {
         let (mut read, _) = self.queue.split();
         let packet = match read.try_read() {
             Ok(packet) => match parse_packet(&packet, send_buffer, version, external_data) {
@@ -4927,15 +4940,15 @@ impl<T: 'static + RingMem> NetChannel<T> {
                         error = &err as &dyn std::error::Error,
                         "failed to parse packet, skipping"
                     );
-                    return Ok(None);
+                    return Ok(TryNextPacket::Skipped);
                 }
             },
-            Err(queue::TryReadError::Empty) => return Ok(None),
+            Err(queue::TryReadError::Empty) => return Ok(TryNextPacket::Empty),
             Err(queue::TryReadError::Queue(err)) => return Err(err.into()),
         };
 
         tracing::trace!(target: "netvsp/vmbus", data = ?packet.data, "incoming vmbus packet");
-        Ok(Some(packet))
+        Ok(TryNextPacket::Packet(packet))
     }
 
     async fn next_packet<'a>(
@@ -5639,14 +5652,19 @@ impl<T: 'static + RingMem> NetChannel<T> {
             if state.free_tx_packets.is_empty() {
                 break;
             }
-            let packet = if let Some(packet) = self.try_next_packet(
+            let packet = match self.try_next_packet(
                 buffers.send_buffer.as_ref(),
                 Some(buffers.version),
                 &mut data.external_data,
             )? {
-                packet
-            } else {
-                break;
+                TryNextPacket::Packet(packet) => packet,
+                TryNextPacket::Skipped => {
+                    // A malformed packet was consumed; keep processing and
+                    // count the wake as having done work.
+                    did_some_work = true;
+                    continue;
+                }
+                TryNextPacket::Empty => break,
             };
 
             did_some_work = true;
