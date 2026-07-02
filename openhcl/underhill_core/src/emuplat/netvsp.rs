@@ -341,7 +341,7 @@ struct HclNetworkVFManagerWorker {
     #[inspect(skip)]
     dma_clients: VfioDmaClients,
     #[inspect(skip)]
-    vf_reset_request_receiver: Option<mesh::Receiver<bool>>,
+    vf_reset_request_receiver: Option<mesh::OneshotReceiver<bool>>,
     #[inspect(skip)]
     network_adapter_index: NetworkAdapterIndex,
 }
@@ -605,6 +605,8 @@ impl HclNetworkVFManagerWorker {
     /// purpose so the host-side VF stays alive across servicing.
     pub async fn shutdown_vtl2_device(&mut self, keep_vf_alive: bool) {
         self.disconnect_all_endpoints().await;
+        // Drop reset-request receiver; the device is going away.
+        self.vf_reset_request_receiver = None;
         let vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control);
         if let Some(device) = self.mana_device.take() {
             let (result, device) = device
@@ -1025,6 +1027,27 @@ impl HclNetworkVFManagerWorker {
         .await
     }
 
+    /// Adapts the oneshot vf reset request receiver into a futures stream that
+    /// yields at most one item. When it fires, the receiver is cleared and the
+    /// received value is yielded. If the receiver is `None` the stream is
+    /// permanently pending. If the sender drops without sending, the stream ends
+    /// without yielding.
+    /// Note: the bool value represents whether the VTL0 VF should be revoked.
+    fn vf_reset_stream(
+        recv: &mut Option<mesh::OneshotReceiver<bool>>,
+    ) -> impl futures::Stream<Item = bool> + '_ {
+        futures::stream::poll_fn(|cx| {
+            let Some(r) = recv.as_mut() else {
+                return Poll::Pending;
+            };
+            let result = std::pin::Pin::new(r).poll(cx);
+            if result.is_ready() {
+                *recv = None;
+            }
+            result.map(|r| r.ok())
+        })
+    }
+
     /// Begins recovery after the MANA device requests VF reconfiguration.
     ///
     /// This clears the guest-visible VTL0 state, revokes any offered VF, and
@@ -1275,10 +1298,7 @@ impl HclNetworkVFManagerWorker {
                     }
                 });
 
-                let vf_reset_request = self
-                    .vf_reset_request_receiver
-                    .as_mut()
-                    .unwrap()
+                let vf_reset_request = Self::vf_reset_stream(&mut self.vf_reset_request_receiver)
                     .map(NextWorkItem::VfReconfig);
                 let reconfig_restart_deadline = vf_reconfig_backoff.map(|backoff| backoff.deadline);
                 let wait_for_reconfig = futures::stream::once(async {

@@ -69,7 +69,7 @@ struct Inner<T: DeviceBacking> {
     dev_config: ManaQueryDeviceCfgResp,
     doorbell: Arc<dyn Doorbell>,
     vport_link_status: Arc<Mutex<Vec<LinkStatus>>>,
-    vf_reset_request_sender: Arc<Mutex<Option<mesh::Sender<bool>>>>,
+    vf_reset_request_sender: Arc<Mutex<Option<mesh::OneshotSender<bool>>>>,
 }
 
 impl<T: DeviceBacking> ManaDevice<T> {
@@ -247,7 +247,7 @@ impl<T: DeviceBacking> ManaDevice<T> {
                         }
                         if let Some(revoke_vtl0_vf) = gdma.get_reset_request_pending() {
                             // `reset_request_pending` stays true until destruction.
-                            // Take the sender so we only notify once per lifetime.
+                            // `send` consumes the sender; only notify once per lifetime.
                             if let Some(sender) = inner.vf_reset_request_sender.lock().await.take()
                             {
                                 sender.send(revoke_vtl0_vf);
@@ -295,15 +295,15 @@ impl<T: DeviceBacking> ManaDevice<T> {
     }
 
     /// Subscribes to HWC reset request events.
-    /// Returned receiver will receive a message on HWC reset request events.
-    pub async fn subscribe_vf_reset_request(&self) -> mesh::Receiver<bool> {
+    /// Returned receiver fires once on a HWC reset request event.
+    pub async fn subscribe_vf_reset_request(&self) -> mesh::OneshotReceiver<bool> {
         tracing::debug!("subscribing to HWC reset request events");
         let mut reset_request_sender = self.inner.vf_reset_request_sender.lock().await;
         assert!(
             reset_request_sender.is_none(),
             "multiple HWC reset request subscribers not supported"
         );
-        let (sender, receiver) = mesh::channel();
+        let (sender, receiver) = mesh::oneshot();
         *reset_request_sender = Some(sender);
         receiver
     }
