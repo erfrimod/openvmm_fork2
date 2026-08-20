@@ -73,6 +73,82 @@ enum HclNetworkVfManagerMessage {
     SaveState(Rpc<(), VfManagerSaveResult>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VfManagerAction {
+    AddVtl0,
+    RemoveVtl0,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Vtl0TransitionInput {
+    vtl2_device_state: Vtl2DeviceState,
+    visible_and_present: bool,
+    offered_to_guest: bool,
+}
+
+fn transition(
+    is_shutdown_active: &mut bool,
+    message: &HclNetworkVfManagerMessage,
+    input: Vtl0TransitionInput,
+) -> Vec<VfManagerAction> {
+    match message {
+        HclNetworkVfManagerMessage::AddVtl0VF => {
+            if !*is_shutdown_active
+                && matches!(input.vtl2_device_state, Vtl2DeviceState::Present)
+                && input.visible_and_present
+                && !input.offered_to_guest
+            {
+                vec![VfManagerAction::AddVtl0]
+            } else {
+                tracing::info!(
+                    is_shutdown_active = *is_shutdown_active,
+                    vtl2_device_state = ?input.vtl2_device_state,
+                    vtl0_visible_and_present = input.visible_and_present,
+                    offered_to_guest = input.offered_to_guest,
+                    "ignoring request to add VTL0 VF"
+                );
+                Vec::new()
+            }
+        }
+        HclNetworkVfManagerMessage::RemoveVtl0VF => {
+            if !*is_shutdown_active && input.visible_and_present && input.offered_to_guest {
+                vec![VfManagerAction::RemoveVtl0]
+            } else {
+                tracing::info!(
+                    is_shutdown_active = *is_shutdown_active,
+                    vtl2_device_state = ?input.vtl2_device_state,
+                    vtl0_visible_and_present = input.visible_and_present,
+                    offered_to_guest = input.offered_to_guest,
+                    "ignoring request to remove VTL0 VF"
+                );
+                Vec::new()
+            }
+        }
+        HclNetworkVfManagerMessage::ShutdownBegin(remove_vtl0) => {
+            let shutdown_was_active = *is_shutdown_active;
+            let should_remove_vtl0 = !shutdown_was_active
+                && *remove_vtl0
+                && input.visible_and_present
+                && input.offered_to_guest;
+            *is_shutdown_active = true;
+            if should_remove_vtl0 {
+                vec![VfManagerAction::RemoveVtl0]
+            } else {
+                tracing::info!(
+                    shutdown_was_active,
+                    remove_vtl0,
+                    vtl2_device_state = ?input.vtl2_device_state,
+                    vtl0_visible_and_present = input.visible_and_present,
+                    offered_to_guest = input.offered_to_guest,
+                    "not removing VTL0 VF during shutdown"
+                );
+                Vec::new()
+            }
+        }
+        _ => unreachable!("message does not have a VTL0 transition"),
+    }
+}
+
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum VfManagerSaveResult {
@@ -655,37 +731,31 @@ impl HclNetworkVFManagerWorker {
     /// On return, `guest_state.offered_to_guest` is true only if the offer
     /// RPC succeeds; otherwise the worker state is left unchanged.
     async fn add_vtl0_vf(&mut self) {
+        assert!(!self.guest_state.is_offered_to_guest().await);
+        assert!(self.guest_state.vtl0_vfid().await.is_some());
+        let Vtl0Bus::Present(vtl0_bus_control) = &self.vtl0_bus_control else {
+            unreachable!("add_vtl0_vf requires a visible VTL0 VF");
+        };
+
         let vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control);
-        if !self.guest_state.is_offered_to_guest().await
-            && self.guest_state.vtl0_vfid().await.is_some()
+        match vtl0_bus_control
+            .offer_device()
+            .instrument(tracing::info_span!(
+                "adding VF to VTL0",
+                vtl2_vfid,
+                vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control)
+            ))
+            .await
         {
-            if let Vtl0Bus::Present(vtl0_bus_control) = &self.vtl0_bus_control {
-                match vtl0_bus_control
-                    .offer_device()
-                    .instrument(tracing::info_span!(
-                        "adding VF to VTL0",
-                        vtl2_vfid,
-                        vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control)
-                    ))
-                    .await
-                {
-                    Ok(_) => {
-                        *self.guest_state.offered_to_guest.lock().await = true;
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            vtl2_vfid,
-                            vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control),
-                            err = err.as_ref() as &dyn std::error::Error,
-                            "Failed to add VTL0 VF"
-                        );
-                    }
-                }
-            } else {
-                tracing::info!(
+            Ok(_) => {
+                *self.guest_state.offered_to_guest.lock().await = true;
+            }
+            Err(err) => {
+                tracing::error!(
                     vtl2_vfid,
-                    %self.vtl0_bus_control,
-                    "Ignoring VTL0 device request from guest"
+                    vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control),
+                    err = err.as_ref() as &dyn std::error::Error,
+                    "Failed to add VTL0 VF"
                 );
             }
         }
@@ -770,22 +840,43 @@ impl HclNetworkVFManagerWorker {
     /// `guest_state.offered_to_guest` is always false even if the RPC fails or
     /// times out.
     async fn remove_vtl0_vf(&mut self) {
+        assert!(self.guest_state.is_offered_to_guest().await);
+        let Vtl0Bus::Present(vtl0_bus_control) = &self.vtl0_bus_control else {
+            unreachable!("remove_vtl0_vf requires a visible VTL0 VF");
+        };
+
         let vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
         let vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control);
-        if self.guest_state.is_offered_to_guest().await {
-            *self.guest_state.offered_to_guest.lock().await = false;
-            if let Vtl0Bus::Present(vtl0_bus_control) = &self.vtl0_bus_control {
-                match self.revoke_vtl0_vf(vtl0_bus_control).await {
-                    Ok(_) => (),
-                    Err(err) => {
-                        tracing::error!(
-                            vtl2_vfid,
-                            vtl0_vfid,
-                            err = err.as_ref() as &dyn std::error::Error,
-                            "Failed to remove VTL0 VF"
-                        );
-                    }
-                }
+        *self.guest_state.offered_to_guest.lock().await = false;
+        match self.revoke_vtl0_vf(vtl0_bus_control).await {
+            Ok(_) => (),
+            Err(err) => {
+                tracing::error!(
+                    vtl2_vfid,
+                    vtl0_vfid,
+                    err = err.as_ref() as &dyn std::error::Error,
+                    "Failed to remove VTL0 VF"
+                );
+            }
+        }
+    }
+
+    async fn process_vf_manager_message(
+        &mut self,
+        message: HclNetworkVfManagerMessage,
+        vtl2_device_state: Vtl2DeviceState,
+    ) {
+        let input = Vtl0TransitionInput {
+            vtl2_device_state,
+            visible_and_present: matches!(self.vtl0_bus_control, Vtl0Bus::Present(_)),
+            offered_to_guest: self.guest_state.is_offered_to_guest().await,
+        };
+        let actions = transition(&mut self.is_shutdown_active, &message, input);
+
+        for action in actions {
+            match action {
+                VfManagerAction::AddVtl0 => self.add_vtl0_vf().await,
+                VfManagerAction::RemoveVtl0 => self.remove_vtl0_vf().await,
             }
         }
     }
@@ -1341,22 +1432,16 @@ impl HclNetworkVFManagerWorker {
                         .instrument(tracing::info_span!("packet capture", vtl2_vfid))
                         .await
                 }
-                NextWorkItem::ManagerMessage(HclNetworkVfManagerMessage::AddVtl0VF) => {
-                    if self.is_shutdown_active {
-                        continue;
-                    }
-
-                    self.add_vtl0_vf()
+                NextWorkItem::ManagerMessage(message @ HclNetworkVfManagerMessage::AddVtl0VF) => {
+                    self.process_vf_manager_message(message, vtl2_device_state)
                         .instrument(tracing::info_span!("add vtl0 vf", vtl2_vfid))
                         .await;
                 }
-                NextWorkItem::ManagerMessage(HclNetworkVfManagerMessage::RemoveVtl0VF) => {
-                    if self.is_shutdown_active {
-                        continue;
-                    }
-
+                NextWorkItem::ManagerMessage(
+                    message @ HclNetworkVfManagerMessage::RemoveVtl0VF,
+                ) => {
                     let vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
-                    self.remove_vtl0_vf()
+                    self.process_vf_manager_message(message, vtl2_device_state)
                         .instrument(tracing::info_span!("remove vtl0 vf", vtl2_vfid, vtl0_vfid))
                         .await;
                 }
@@ -1389,9 +1474,9 @@ impl HclNetworkVFManagerWorker {
                     // Exit worker thread.
                     return;
                 }
-                NextWorkItem::ManagerMessage(HclNetworkVfManagerMessage::ShutdownBegin(
-                    remove_vtl0_vf,
-                )) => {
+                NextWorkItem::ManagerMessage(
+                    message @ HclNetworkVfManagerMessage::ShutdownBegin(remove_vtl0_vf),
+                ) => {
                     let vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
                     tracing::info!(
                         vtl2_vfid,
@@ -1399,16 +1484,8 @@ impl HclNetworkVFManagerWorker {
                         remove_vtl0_vf,
                         "beginning VTL2 device shutdown"
                     );
-                    if remove_vtl0_vf {
-                        self.remove_vtl0_vf()
-                            .instrument(tracing::info_span!(
-                                "remove vtl0 vf for shutdown",
-                                vtl2_vfid,
-                                vtl0_vfid
-                            ))
-                            .await;
-                    }
-                    self.is_shutdown_active = true;
+                    self.process_vf_manager_message(message, vtl2_device_state)
+                        .await;
                 }
                 NextWorkItem::ManagerMessage(HclNetworkVfManagerMessage::ShutdownComplete(rpc)) => {
                     tracing::info!(vtl2_vfid, "shutting down VTL2 device");
@@ -2160,6 +2237,267 @@ mod save_restore {
                 direction_to_vtl0,
                 hidden_vtl0,
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HclNetworkVfManagerMessage;
+    use super::VfManagerAction;
+    use super::Vtl0TransitionInput;
+    use super::Vtl2DeviceState;
+    use super::transition;
+    use test_with_tracing::test;
+
+    #[derive(Debug)]
+    struct TransitionTestCase {
+        name: &'static str,
+        shutdown_active: bool,
+        message: HclNetworkVfManagerMessage,
+        vtl2_state: Vtl2DeviceState,
+        vtl0_visible_and_present: bool,
+        offered_to_guest: bool,
+        expected_actions: &'static [VfManagerAction],
+        expected_shutdown_active: bool,
+    }
+
+    fn assert_transition(test_case: TransitionTestCase) {
+        let mut is_shutdown_active = test_case.shutdown_active;
+        let actions = transition(
+            &mut is_shutdown_active,
+            &test_case.message,
+            Vtl0TransitionInput {
+                vtl2_device_state: test_case.vtl2_state,
+                visible_and_present: test_case.vtl0_visible_and_present,
+                offered_to_guest: test_case.offered_to_guest,
+            },
+        );
+
+        assert_eq!(
+            actions.as_slice(),
+            test_case.expected_actions,
+            "actions for test case: {} ({test_case:?})",
+            test_case.name,
+        );
+        assert_eq!(
+            is_shutdown_active, test_case.expected_shutdown_active,
+            "test case: {} ({test_case:?})",
+            test_case.name,
+        );
+    }
+
+    #[test]
+    fn add_vtl0_transition() {
+        for test_case in [
+            TransitionTestCase {
+                name: "offer visible VTL0 while VTL2 is present",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::AddVtl0VF,
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: true,
+                offered_to_guest: false,
+                expected_actions: &[VfManagerAction::AddVtl0],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "do not offer while VTL2 is enumerated",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::AddVtl0VF,
+                vtl2_state: Vtl2DeviceState::DeviceEnumerated,
+                vtl0_visible_and_present: true,
+                offered_to_guest: false,
+                expected_actions: &[],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "do not offer while VTL2 is missing",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::AddVtl0VF,
+                vtl2_state: Vtl2DeviceState::Missing,
+                vtl0_visible_and_present: true,
+                offered_to_guest: false,
+                expected_actions: &[],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "do not offer while VTL2 is reconfiguring",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::AddVtl0VF,
+                vtl2_state: Vtl2DeviceState::Reconfiguring,
+                vtl0_visible_and_present: true,
+                offered_to_guest: false,
+                expected_actions: &[],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "do not offer hidden or absent VTL0",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::AddVtl0VF,
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: false,
+                offered_to_guest: false,
+                expected_actions: &[],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "do not offer VTL0 twice",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::AddVtl0VF,
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: true,
+                offered_to_guest: true,
+                expected_actions: &[],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "do not offer during shutdown",
+                shutdown_active: true,
+                message: HclNetworkVfManagerMessage::AddVtl0VF,
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: true,
+                offered_to_guest: false,
+                expected_actions: &[],
+                expected_shutdown_active: true,
+            },
+        ] {
+            assert_transition(test_case);
+        }
+    }
+
+    #[test]
+    fn remove_vtl0_transition() {
+        for test_case in [
+            TransitionTestCase {
+                name: "remove offered VTL0 while VTL2 is present",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::RemoveVtl0VF,
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: true,
+                offered_to_guest: true,
+                expected_actions: &[VfManagerAction::RemoveVtl0],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "remove offered VTL0 while VTL2 is enumerated",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::RemoveVtl0VF,
+                vtl2_state: Vtl2DeviceState::DeviceEnumerated,
+                vtl0_visible_and_present: true,
+                offered_to_guest: true,
+                expected_actions: &[VfManagerAction::RemoveVtl0],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "remove offered VTL0 while VTL2 is missing",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::RemoveVtl0VF,
+                vtl2_state: Vtl2DeviceState::Missing,
+                vtl0_visible_and_present: true,
+                offered_to_guest: true,
+                expected_actions: &[VfManagerAction::RemoveVtl0],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "remove offered VTL0 while VTL2 is reconfiguring",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::RemoveVtl0VF,
+                vtl2_state: Vtl2DeviceState::Reconfiguring,
+                vtl0_visible_and_present: true,
+                offered_to_guest: true,
+                expected_actions: &[VfManagerAction::RemoveVtl0],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "do not remove VTL0 twice",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::RemoveVtl0VF,
+                vtl2_state: Vtl2DeviceState::Missing,
+                vtl0_visible_and_present: true,
+                offered_to_guest: false,
+                expected_actions: &[],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "do not remove hidden or absent VTL0",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::RemoveVtl0VF,
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: false,
+                offered_to_guest: true,
+                expected_actions: &[],
+                expected_shutdown_active: false,
+            },
+            TransitionTestCase {
+                name: "do not remove during shutdown",
+                shutdown_active: true,
+                message: HclNetworkVfManagerMessage::RemoveVtl0VF,
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: true,
+                offered_to_guest: true,
+                expected_actions: &[],
+                expected_shutdown_active: true,
+            },
+        ] {
+            assert_transition(test_case);
+        }
+    }
+
+    #[test]
+    fn shutdown_begin_transition() {
+        for test_case in [
+            TransitionTestCase {
+                name: "remove offered VTL0 before entering shutdown",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::ShutdownBegin(true),
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: true,
+                offered_to_guest: true,
+                expected_actions: &[VfManagerAction::RemoveVtl0],
+                expected_shutdown_active: true,
+            },
+            TransitionTestCase {
+                name: "retain VTL0 when shutdown does not request removal",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::ShutdownBegin(false),
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: true,
+                offered_to_guest: true,
+                expected_actions: &[],
+                expected_shutdown_active: true,
+            },
+            TransitionTestCase {
+                name: "do not remove an unoffered VTL0 during shutdown",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::ShutdownBegin(true),
+                vtl2_state: Vtl2DeviceState::Missing,
+                vtl0_visible_and_present: true,
+                offered_to_guest: false,
+                expected_actions: &[],
+                expected_shutdown_active: true,
+            },
+            TransitionTestCase {
+                name: "do not remove hidden or absent VTL0 during shutdown",
+                shutdown_active: false,
+                message: HclNetworkVfManagerMessage::ShutdownBegin(true),
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: false,
+                offered_to_guest: true,
+                expected_actions: &[],
+                expected_shutdown_active: true,
+            },
+            TransitionTestCase {
+                name: "repeated shutdown begin is idempotent",
+                shutdown_active: true,
+                message: HclNetworkVfManagerMessage::ShutdownBegin(true),
+                vtl2_state: Vtl2DeviceState::Present,
+                vtl0_visible_and_present: true,
+                offered_to_guest: true,
+                expected_actions: &[],
+                expected_shutdown_active: true,
+            },
+        ] {
+            assert_transition(test_case);
         }
     }
 }
