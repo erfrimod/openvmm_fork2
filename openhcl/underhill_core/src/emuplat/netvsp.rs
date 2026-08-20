@@ -149,6 +149,70 @@ fn transition(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Vtl0Bus<T = HclVpciBusControl> {
+    NotPresent,
+    Present(T),
+    HiddenNotPresent,
+    HiddenPresent(T),
+}
+
+type Vtl0BusState = Vtl0Bus<()>;
+
+#[derive(Clone, Copy, Debug)]
+enum Vtl0BusChange {
+    Update { present: bool },
+    SetHidden(bool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Vtl0BusAction {
+    NotifyArrival,
+    NotifyRemovalAndRevoke,
+}
+
+fn transition_vtl0_bus(
+    state: Vtl0BusState,
+    change: Vtl0BusChange,
+    vtl2_device_state: Vtl2DeviceState,
+) -> (Vtl0BusState, Option<Vtl0BusAction>) {
+    let vtl2_present = matches!(vtl2_device_state, Vtl2DeviceState::Present);
+    match (state, change) {
+        (Vtl0BusState::NotPresent, Vtl0BusChange::Update { present: true }) => (
+            Vtl0BusState::Present(()),
+            vtl2_present.then_some(Vtl0BusAction::NotifyArrival),
+        ),
+        (Vtl0BusState::Present(()), Vtl0BusChange::Update { present: false }) => (
+            Vtl0BusState::NotPresent,
+            vtl2_present.then_some(Vtl0BusAction::NotifyRemovalAndRevoke),
+        ),
+        (Vtl0BusState::HiddenNotPresent, Vtl0BusChange::Update { present: true }) => {
+            (Vtl0BusState::HiddenPresent(()), None)
+        }
+        (Vtl0BusState::HiddenPresent(()), Vtl0BusChange::Update { present: false }) => {
+            (Vtl0BusState::HiddenNotPresent, None)
+        }
+        (Vtl0BusState::NotPresent, Vtl0BusChange::SetHidden(true)) => {
+            (Vtl0BusState::HiddenNotPresent, None)
+        }
+        (Vtl0BusState::Present(()), Vtl0BusChange::SetHidden(true)) => (
+            Vtl0BusState::HiddenPresent(()),
+            vtl2_present.then_some(Vtl0BusAction::NotifyRemovalAndRevoke),
+        ),
+        (Vtl0BusState::HiddenNotPresent, Vtl0BusChange::SetHidden(false)) => {
+            (Vtl0BusState::NotPresent, None)
+        }
+        (Vtl0BusState::HiddenPresent(()), Vtl0BusChange::SetHidden(false)) => (
+            Vtl0BusState::Present(()),
+            vtl2_present.then_some(Vtl0BusAction::NotifyArrival),
+        ),
+        (state, Vtl0BusChange::SetHidden(_)) => (state, None),
+        (_, Vtl0BusChange::Update { .. }) => {
+            unreachable!("VTL0 update must change device presence")
+        }
+    }
+}
+
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum VfManagerSaveResult {
@@ -344,12 +408,17 @@ impl HclNetworkVFManagerGuestState {
     }
 }
 
-enum Vtl0Bus {
-    NotPresent,
-    Present(HclVpciBusControl),
-    HiddenNotPresent,
-    HiddenPresent(HclVpciBusControl),
+impl<T> Vtl0Bus<T> {
+    fn state(&self) -> Vtl0BusState {
+        match self {
+            Self::NotPresent => Vtl0BusState::NotPresent,
+            Self::Present(_) => Vtl0BusState::Present(()),
+            Self::HiddenNotPresent => Vtl0BusState::HiddenNotPresent,
+            Self::HiddenPresent(_) => Vtl0BusState::HiddenPresent(()),
+        }
+    }
 }
+
 impl std::fmt::Display for Vtl0Bus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -778,39 +847,47 @@ impl HclNetworkVFManagerWorker {
                 "setting VTL0 VF hidden state"
             );
             *self.save_state.hidden_vtl0.lock() = Some(hide_vtl0);
-            if hide_vtl0 {
-                if !matches!(self.vtl0_bus_control, Vtl0Bus::HiddenPresent(_)) {
+            let current_state = self.vtl0_bus_control.state();
+            let (next_state, action) = transition_vtl0_bus(
+                current_state,
+                Vtl0BusChange::SetHidden(hide_vtl0),
+                *vtl2_device_state,
+            );
+            match (current_state, next_state) {
+                (current_state, next_state) if current_state == next_state => {}
+                (Vtl0BusState::NotPresent, Vtl0BusState::HiddenNotPresent) => {
+                    self.vtl0_bus_control = Vtl0Bus::HiddenNotPresent;
+                }
+                (Vtl0BusState::Present(()), Vtl0BusState::HiddenPresent(())) => {
                     let old_bus_control =
                         std::mem::replace(&mut self.vtl0_bus_control, Vtl0Bus::HiddenNotPresent);
-                    if matches!(old_bus_control, Vtl0Bus::Present(_)) {
-                        if matches!(vtl2_device_state, Vtl2DeviceState::Present) {
-                            *self.guest_state.vtl0_vfid.lock().await =
-                                vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
-                            self.try_notify_guest_and_revoke_vtl0_vf(&old_bus_control)
-                                .await;
-                        }
-                        let Vtl0Bus::Present(bus_control) = old_bus_control else {
-                            unreachable!();
-                        };
-                        self.vtl0_bus_control = Vtl0Bus::HiddenPresent(bus_control);
+                    if matches!(action, Some(Vtl0BusAction::NotifyRemovalAndRevoke)) {
+                        *self.guest_state.vtl0_vfid.lock().await = None;
+                        self.try_notify_guest_and_revoke_vtl0_vf(&old_bus_control)
+                            .await;
                     }
+                    let Vtl0Bus::Present(bus_control) = old_bus_control else {
+                        unreachable!();
+                    };
+                    self.vtl0_bus_control = Vtl0Bus::HiddenPresent(bus_control);
                 }
-            } else {
-                if matches!(self.vtl0_bus_control, Vtl0Bus::HiddenPresent(_)) {
+                (Vtl0BusState::HiddenNotPresent, Vtl0BusState::NotPresent) => {
+                    self.vtl0_bus_control = Vtl0Bus::NotPresent;
+                }
+                (Vtl0BusState::HiddenPresent(()), Vtl0BusState::Present(())) => {
                     let Vtl0Bus::HiddenPresent(bus_control) =
                         std::mem::replace(&mut self.vtl0_bus_control, Vtl0Bus::NotPresent)
                     else {
                         unreachable!();
                     };
                     self.vtl0_bus_control = Vtl0Bus::Present(bus_control);
-                    if matches!(vtl2_device_state, Vtl2DeviceState::Present) {
+                    if matches!(action, Some(Vtl0BusAction::NotifyArrival)) {
                         *self.guest_state.vtl0_vfid.lock().await =
                             vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
                         self.notify_vtl0_vf_arrival();
                     }
-                } else if matches!(self.vtl0_bus_control, Vtl0Bus::HiddenNotPresent) {
-                    self.vtl0_bus_control = Vtl0Bus::NotPresent;
                 }
+                _ => unreachable!("invalid VTL0 hidden-state transition"),
             }
         })
         .await
@@ -894,9 +971,10 @@ impl HclNetworkVFManagerWorker {
         vtl2_device_state: &Vtl2DeviceState,
     ) {
         rpc.handle(async |bus_control| {
+            let current_state = self.vtl0_bus_control.state();
             let is_present = matches!(
-                self.vtl0_bus_control,
-                Vtl0Bus::Present(_) | Vtl0Bus::HiddenPresent(_)
+                current_state,
+                Vtl0BusState::Present(()) | Vtl0BusState::HiddenPresent(())
             );
             assert!(is_present != bus_control.is_some());
             tracing::info!(
@@ -905,31 +983,49 @@ impl HclNetworkVFManagerWorker {
                 present = bus_control.is_some(),
                 "VTL0 VF device change"
             );
-            if matches!(&self.vtl0_bus_control, Vtl0Bus::HiddenNotPresent) {
-                self.vtl0_bus_control = Vtl0Bus::HiddenPresent(bus_control.unwrap())
-            } else if matches!(&self.vtl0_bus_control, Vtl0Bus::HiddenPresent(_)) {
-                self.vtl0_bus_control = Vtl0Bus::HiddenNotPresent;
-            } else if matches!(vtl2_device_state, Vtl2DeviceState::Present) {
-                let bus_control = bus_control
-                    .map(Vtl0Bus::Present)
-                    .unwrap_or(Vtl0Bus::NotPresent);
-                *self.guest_state.vtl0_vfid.lock().await = vtl0_vfid_from_bus_control(&bus_control);
-                let old_bus_control = std::mem::replace(&mut self.vtl0_bus_control, bus_control);
-                match self.vtl0_bus_control {
-                    Vtl0Bus::Present(_) => self.notify_vtl0_vf_arrival(),
-                    Vtl0Bus::NotPresent => {
-                        self.try_notify_guest_and_revoke_vtl0_vf(&old_bus_control)
-                            .await
-                    }
-                    _ => unreachable!(),
-                }
-            } else {
+            let (next_state, action) = transition_vtl0_bus(
+                current_state,
+                Vtl0BusChange::Update {
+                    present: bus_control.is_some(),
+                },
+                *vtl2_device_state,
+            );
+            if action.is_none()
+                && !matches!(vtl2_device_state, Vtl2DeviceState::Present)
+                && matches!(
+                    current_state,
+                    Vtl0BusState::NotPresent | Vtl0BusState::Present(())
+                )
+            {
                 // When the VTL2 device is restored, the VTL0 update will be applied.
                 assert_eq!(*self.guest_state.offered_to_guest.lock().await, false);
                 assert!(self.guest_state.vtl0_vfid.lock().await.is_none());
-                self.vtl0_bus_control = bus_control
-                    .map(Vtl0Bus::Present)
-                    .unwrap_or(Vtl0Bus::NotPresent);
+            }
+            match (current_state, next_state) {
+                (Vtl0BusState::NotPresent, Vtl0BusState::Present(())) => {
+                    self.vtl0_bus_control = Vtl0Bus::Present(bus_control.unwrap());
+                    if matches!(action, Some(Vtl0BusAction::NotifyArrival)) {
+                        *self.guest_state.vtl0_vfid.lock().await =
+                            vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
+                        self.notify_vtl0_vf_arrival();
+                    }
+                }
+                (Vtl0BusState::Present(()), Vtl0BusState::NotPresent) => {
+                    let old_bus_control =
+                        std::mem::replace(&mut self.vtl0_bus_control, Vtl0Bus::NotPresent);
+                    if matches!(action, Some(Vtl0BusAction::NotifyRemovalAndRevoke)) {
+                        *self.guest_state.vtl0_vfid.lock().await = None;
+                        self.try_notify_guest_and_revoke_vtl0_vf(&old_bus_control)
+                            .await;
+                    }
+                }
+                (Vtl0BusState::HiddenNotPresent, Vtl0BusState::HiddenPresent(())) => {
+                    self.vtl0_bus_control = Vtl0Bus::HiddenPresent(bus_control.unwrap());
+                }
+                (Vtl0BusState::HiddenPresent(()), Vtl0BusState::HiddenNotPresent) => {
+                    self.vtl0_bus_control = Vtl0Bus::HiddenNotPresent;
+                }
+                _ => unreachable!("invalid VTL0 presence transition"),
             }
         })
         .await
@@ -2245,9 +2341,13 @@ mod save_restore {
 mod tests {
     use super::HclNetworkVfManagerMessage;
     use super::VfManagerAction;
+    use super::Vtl0BusAction;
+    use super::Vtl0BusChange;
+    use super::Vtl0BusState;
     use super::Vtl0TransitionInput;
     use super::Vtl2DeviceState;
     use super::transition;
+    use super::transition_vtl0_bus;
     use test_with_tracing::test;
 
     #[derive(Debug)]
@@ -2499,5 +2599,127 @@ mod tests {
         ] {
             assert_transition(test_case);
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct Vtl0BusTransitionStep {
+        name: &'static str,
+        change: Vtl0BusChange,
+        vtl2_state: Vtl2DeviceState,
+        expected_state: Vtl0BusState,
+        expected_action: Option<Vtl0BusAction>,
+    }
+
+    fn assert_vtl0_bus_sequence(initial_state: Vtl0BusState, steps: &[Vtl0BusTransitionStep]) {
+        let mut state = initial_state;
+        for step in steps {
+            let (next_state, action) = transition_vtl0_bus(state, step.change, step.vtl2_state);
+            assert_eq!(
+                next_state, step.expected_state,
+                "state after step: {} ({step:?})",
+                step.name
+            );
+            assert_eq!(
+                action, step.expected_action,
+                "action for step: {} ({step:?})",
+                step.name
+            );
+            state = next_state;
+        }
+    }
+
+    #[test]
+    fn visible_vtl0_update_sequence() {
+        assert_vtl0_bus_sequence(
+            Vtl0BusState::NotPresent,
+            &[
+                Vtl0BusTransitionStep {
+                    name: "add visible VTL0 while VTL2 is present",
+                    change: Vtl0BusChange::Update { present: true },
+                    vtl2_state: Vtl2DeviceState::Present,
+                    expected_state: Vtl0BusState::Present(()),
+                    expected_action: Some(Vtl0BusAction::NotifyArrival),
+                },
+                Vtl0BusTransitionStep {
+                    name: "remove visible VTL0 while VTL2 is present",
+                    change: Vtl0BusChange::Update { present: false },
+                    vtl2_state: Vtl2DeviceState::Present,
+                    expected_state: Vtl0BusState::NotPresent,
+                    expected_action: Some(Vtl0BusAction::NotifyRemovalAndRevoke),
+                },
+                Vtl0BusTransitionStep {
+                    name: "stage visible VTL0 while VTL2 is missing",
+                    change: Vtl0BusChange::Update { present: true },
+                    vtl2_state: Vtl2DeviceState::Missing,
+                    expected_state: Vtl0BusState::Present(()),
+                    expected_action: None,
+                },
+                Vtl0BusTransitionStep {
+                    name: "remove staged VTL0 while VTL2 is missing",
+                    change: Vtl0BusChange::Update { present: false },
+                    vtl2_state: Vtl2DeviceState::Missing,
+                    expected_state: Vtl0BusState::NotPresent,
+                    expected_action: None,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn vtl0_hide_update_sequence() {
+        assert_vtl0_bus_sequence(
+            Vtl0BusState::Present(()),
+            &[
+                Vtl0BusTransitionStep {
+                    name: "hide visible VTL0 while VTL2 is present",
+                    change: Vtl0BusChange::SetHidden(true),
+                    vtl2_state: Vtl2DeviceState::Present,
+                    expected_state: Vtl0BusState::HiddenPresent(()),
+                    expected_action: Some(Vtl0BusAction::NotifyRemovalAndRevoke),
+                },
+                Vtl0BusTransitionStep {
+                    name: "repeated hide is idempotent",
+                    change: Vtl0BusChange::SetHidden(true),
+                    vtl2_state: Vtl2DeviceState::Present,
+                    expected_state: Vtl0BusState::HiddenPresent(()),
+                    expected_action: None,
+                },
+                Vtl0BusTransitionStep {
+                    name: "remove hidden VTL0",
+                    change: Vtl0BusChange::Update { present: false },
+                    vtl2_state: Vtl2DeviceState::Present,
+                    expected_state: Vtl0BusState::HiddenNotPresent,
+                    expected_action: None,
+                },
+                Vtl0BusTransitionStep {
+                    name: "unhide absent VTL0",
+                    change: Vtl0BusChange::SetHidden(false),
+                    vtl2_state: Vtl2DeviceState::Present,
+                    expected_state: Vtl0BusState::NotPresent,
+                    expected_action: None,
+                },
+                Vtl0BusTransitionStep {
+                    name: "hide absent VTL0",
+                    change: Vtl0BusChange::SetHidden(true),
+                    vtl2_state: Vtl2DeviceState::Missing,
+                    expected_state: Vtl0BusState::HiddenNotPresent,
+                    expected_action: None,
+                },
+                Vtl0BusTransitionStep {
+                    name: "stage hidden VTL0 while VTL2 is missing",
+                    change: Vtl0BusChange::Update { present: true },
+                    vtl2_state: Vtl2DeviceState::Missing,
+                    expected_state: Vtl0BusState::HiddenPresent(()),
+                    expected_action: None,
+                },
+                Vtl0BusTransitionStep {
+                    name: "unhide staged VTL0 while VTL2 is missing",
+                    change: Vtl0BusChange::SetHidden(false),
+                    vtl2_state: Vtl2DeviceState::Missing,
+                    expected_state: Vtl0BusState::Present(()),
+                    expected_action: None,
+                },
+            ],
+        );
     }
 }
