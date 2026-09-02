@@ -22,9 +22,15 @@ impl Vtl0State {
 
 /// An ephemeral snapshot of the state needed for one VF manager policy decision.
 ///
-/// The worker constructs this immediately before processing a work item. Work items
-/// are processed serially, so worker-owned state cannot change while that item is
-/// being handled. The snapshot must not be retained across work items.
+/// This captures the shutdown flag, VTL0 bus and guest-offer state, and VTL2
+/// device state. The worker constructs it immediately before dispatching a
+/// `NextWorkItem`, which is processed to completion before the next item is
+/// polled. Consequently, worker-owned state cannot change while the item is
+/// being handled.
+///
+/// The snapshot must not be retained across work items. It would become stale if
+/// work items were processed concurrently or another component began mutating
+/// guest state outside the worker loop.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VfManagerState {
     shutdown_active: bool,
