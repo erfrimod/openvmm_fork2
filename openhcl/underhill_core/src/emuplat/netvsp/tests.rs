@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use super::VfManagerState;
-use super::VfManagerStateInconsistency;
-use super::Vtl0Action;
-use super::Vtl0State;
 use super::Vtl2DeviceState;
+use super::vf_manager_policy::VfManagerState;
+use super::vf_manager_policy::VfManagerStateInconsistency;
+use super::vf_manager_policy::Vtl0Action;
+use super::vf_manager_policy::Vtl0State;
 use test_with_tracing::test;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
