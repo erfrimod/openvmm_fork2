@@ -81,11 +81,27 @@ struct Vtl0State {
     offered_to_guest: bool,
 }
 
+impl Vtl0State {
+    fn new(bus_present: bool, bus_hidden: bool, offered_to_guest: bool) -> Self {
+        Self {
+            bus_present,
+            bus_hidden,
+            offered_to_guest,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct VfManagerState {
     shutdown_active: bool,
     vtl0: Vtl0State,
     vtl2: Vtl2DeviceState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VfManagerStateInconsistency {
+    Vtl0OfferedWhileHidden,
+    Vtl0OfferedWithoutBus,
 }
 
 enum Vtl0Bus {
@@ -102,6 +118,24 @@ enum Vtl0Action {
 }
 
 impl VfManagerState {
+    fn new(shutdown_active: bool, vtl0: Vtl0State, vtl2: Vtl2DeviceState) -> Self {
+        Self {
+            shutdown_active,
+            vtl0,
+            vtl2,
+        }
+    }
+
+    fn inconsistency(&self) -> Option<VfManagerStateInconsistency> {
+        if self.vtl0.offered_to_guest && self.vtl0.bus_hidden {
+            Some(VfManagerStateInconsistency::Vtl0OfferedWhileHidden)
+        } else if self.vtl0.offered_to_guest && !self.vtl0.bus_present {
+            Some(VfManagerStateInconsistency::Vtl0OfferedWithoutBus)
+        } else {
+            None
+        }
+    }
+
     fn should_add(&self) -> bool {
         !self.shutdown_active
             && matches!(self.vtl2, Vtl2DeviceState::Present)
@@ -458,21 +492,25 @@ const RECONFIG_MAX_ATTEMPTS: u64 = 300; // ~10 minutes of retries at max backoff
 
 impl HclNetworkVFManagerWorker {
     async fn vf_manager_state(&self, vtl2: Vtl2DeviceState) -> VfManagerState {
-        VfManagerState {
-            shutdown_active: self.is_shutdown_active,
-            vtl0: Vtl0State {
-                bus_present: matches!(
+        let state = VfManagerState::new(
+            self.is_shutdown_active,
+            Vtl0State::new(
+                matches!(
                     self.vtl0_bus_control,
                     Vtl0Bus::Present(_) | Vtl0Bus::HiddenPresent(_)
                 ),
-                bus_hidden: matches!(
+                matches!(
                     self.vtl0_bus_control,
                     Vtl0Bus::HiddenNotPresent | Vtl0Bus::HiddenPresent(_)
                 ),
-                offered_to_guest: self.guest_state.is_offered_to_guest().await,
-            },
+                self.guest_state.is_offered_to_guest().await,
+            ),
             vtl2,
+        );
+        if let Some(inconsistency) = state.inconsistency() {
+            tracelimit::warn_ratelimited!(?inconsistency, ?state, "inconsistent VF manager state");
         }
+        state
     }
 
     pub fn new(
@@ -1361,7 +1399,7 @@ impl HclNetworkVFManagerWorker {
                         .instrument(tracing::info_span!("add vtl0 vf", vtl2_vfid))
                         .await;
                 } else {
-                    tracing::info!(?state, "ignoring request to add VTL0 VF");
+                    tracelimit::info_ratelimited!(?state, "ignoring request to add VTL0 VF");
                 }
             }
             HclNetworkVfManagerMessage::RemoveVtl0VF => {
@@ -1372,7 +1410,7 @@ impl HclNetworkVFManagerWorker {
                         .instrument(tracing::info_span!("remove vtl0 vf", vtl2_vfid, vtl0_vfid))
                         .await;
                 } else {
-                    tracing::info!(?state, "ignoring request to remove VTL0 VF");
+                    tracelimit::info_ratelimited!(?state, "ignoring request to remove VTL0 VF");
                 }
             }
             HclNetworkVfManagerMessage::UpdateVtl0VF(rpc) => {

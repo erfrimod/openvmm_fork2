@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use super::VfManagerState;
+use super::VfManagerStateInconsistency;
 use super::Vtl0Action;
 use super::Vtl0State;
 use super::Vtl2DeviceState;
@@ -10,10 +11,24 @@ use test_with_tracing::test;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Vtl0BusState {
     NotPresent,
-    Present(()),
+    Present,
     HiddenNotPresent,
-    HiddenPresent(()),
+    HiddenPresent,
 }
+
+const VTL0_BUS_STATES: [Vtl0BusState; 4] = [
+    Vtl0BusState::NotPresent,
+    Vtl0BusState::Present,
+    Vtl0BusState::HiddenNotPresent,
+    Vtl0BusState::HiddenPresent,
+];
+
+const VTL2_DEVICE_STATES: [Vtl2DeviceState; 4] = [
+    Vtl2DeviceState::DeviceEnumerated,
+    Vtl2DeviceState::Missing,
+    Vtl2DeviceState::Present,
+    Vtl2DeviceState::Reconfiguring,
+];
 
 fn state(
     shutdown_active: bool,
@@ -23,234 +38,131 @@ fn state(
 ) -> VfManagerState {
     let (present, hidden) = match bus {
         Vtl0BusState::NotPresent => (false, false),
-        Vtl0BusState::Present(()) => (true, false),
+        Vtl0BusState::Present => (true, false),
         Vtl0BusState::HiddenNotPresent => (false, true),
-        Vtl0BusState::HiddenPresent(()) => (true, true),
+        Vtl0BusState::HiddenPresent => (true, true),
     };
-    VfManagerState {
+    VfManagerState::new(
         shutdown_active,
-        vtl0: Vtl0State {
-            bus_present: present,
-            bus_hidden: hidden,
-            offered_to_guest,
-        },
-        vtl2: vtl2_device_state,
-    }
+        Vtl0State::new(present, hidden, offered_to_guest),
+        vtl2_device_state,
+    )
 }
 
 #[test]
 fn add_vtl0() {
-    for (name, state, expected) in [
-        (
-            "offer visible VTL0 while VTL2 is present",
-            state(
-                false,
-                Vtl2DeviceState::Present,
-                Vtl0BusState::Present(()),
-                false,
-            ),
-            true,
-        ),
-        (
-            "do not offer while VTL2 is enumerated",
-            state(
-                false,
-                Vtl2DeviceState::DeviceEnumerated,
-                Vtl0BusState::Present(()),
-                false,
-            ),
-            false,
-        ),
-        (
-            "do not offer while VTL2 is missing",
-            state(
-                false,
-                Vtl2DeviceState::Missing,
-                Vtl0BusState::Present(()),
-                false,
-            ),
-            false,
-        ),
-        (
-            "do not offer while VTL2 is reconfiguring",
-            state(
-                false,
-                Vtl2DeviceState::Reconfiguring,
-                Vtl0BusState::Present(()),
-                false,
-            ),
-            false,
-        ),
-        (
-            "do not offer absent VTL0",
-            state(
-                false,
-                Vtl2DeviceState::Present,
-                Vtl0BusState::NotPresent,
-                false,
-            ),
-            false,
-        ),
-        (
-            "do not offer VTL0 twice",
-            state(
-                false,
-                Vtl2DeviceState::Present,
-                Vtl0BusState::Present(()),
-                true,
-            ),
-            false,
-        ),
-        (
-            "do not offer during shutdown",
-            state(
-                true,
-                Vtl2DeviceState::Present,
-                Vtl0BusState::Present(()),
-                false,
-            ),
-            false,
-        ),
-    ] {
-        assert_eq!(state.should_add(), expected, "{name}: {state:?}");
+    for shutdown_active in [false, true] {
+        for vtl2 in VTL2_DEVICE_STATES {
+            for bus in VTL0_BUS_STATES {
+                for offered_to_guest in [false, true] {
+                    let expected = matches!(
+                        (shutdown_active, vtl2, bus, offered_to_guest),
+                        (
+                            false,
+                            Vtl2DeviceState::Present,
+                            Vtl0BusState::Present,
+                            false
+                        )
+                    );
+                    let state = state(shutdown_active, vtl2, bus, offered_to_guest);
+                    assert_eq!(state.should_add(), expected, "{state:?}");
+                }
+            }
+        }
     }
 }
 
 #[test]
 fn remove_vtl0() {
-    for (name, state, expected) in [
-        (
-            "remove offered VTL0 while VTL2 is present",
-            state(
-                false,
-                Vtl2DeviceState::Present,
-                Vtl0BusState::Present(()),
-                true,
-            ),
-            true,
-        ),
-        (
-            "remove offered VTL0 while VTL2 is missing",
-            state(
-                false,
-                Vtl2DeviceState::Missing,
-                Vtl0BusState::Present(()),
-                true,
-            ),
-            true,
-        ),
-        (
-            "do not remove VTL0 twice",
-            state(
-                false,
-                Vtl2DeviceState::Missing,
-                Vtl0BusState::Present(()),
-                false,
-            ),
-            false,
-        ),
-        (
-            "do not remove hidden VTL0",
-            state(
-                false,
-                Vtl2DeviceState::Present,
-                Vtl0BusState::HiddenPresent(()),
-                true,
-            ),
-            false,
-        ),
-        (
-            "do not remove during shutdown",
-            state(
-                true,
-                Vtl2DeviceState::Present,
-                Vtl0BusState::Present(()),
-                true,
-            ),
-            false,
-        ),
-    ] {
-        assert_eq!(state.should_remove(), expected, "{name}: {state:?}");
+    for shutdown_active in [false, true] {
+        for vtl2 in VTL2_DEVICE_STATES {
+            for bus in VTL0_BUS_STATES {
+                for offered_to_guest in [false, true] {
+                    let expected = matches!(
+                        (shutdown_active, bus, offered_to_guest),
+                        (false, Vtl0BusState::Present, true)
+                    );
+                    let state = state(shutdown_active, vtl2, bus, offered_to_guest);
+                    assert_eq!(state.should_remove(), expected, "{state:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn inconsistent_vtl0_state() {
+    use VfManagerStateInconsistency::{Vtl0OfferedWhileHidden, Vtl0OfferedWithoutBus};
+
+    for bus in VTL0_BUS_STATES {
+        for offered_to_guest in [false, true] {
+            let expected = match (bus, offered_to_guest) {
+                (Vtl0BusState::HiddenNotPresent | Vtl0BusState::HiddenPresent, true) => {
+                    Some(Vtl0OfferedWhileHidden)
+                }
+                (Vtl0BusState::NotPresent, true) => Some(Vtl0OfferedWithoutBus),
+                _ => None,
+            };
+            let state = state(false, Vtl2DeviceState::Present, bus, offered_to_guest);
+            assert_eq!(state.inconsistency(), expected, "{state:?}");
+        }
     }
 }
 
 #[test]
 fn begin_shutdown() {
-    let offered = state(
-        false,
-        Vtl2DeviceState::Present,
-        Vtl0BusState::Present(()),
-        true,
-    );
+    let offered = state(false, Vtl2DeviceState::Present, Vtl0BusState::Present, true);
     assert!(offered.should_remove_for_shutdown(true));
     assert!(!offered.should_remove_for_shutdown(false));
 
-    let shutdown = state(
-        true,
-        Vtl2DeviceState::Present,
-        Vtl0BusState::Present(()),
-        true,
-    );
+    let shutdown = state(true, Vtl2DeviceState::Present, Vtl0BusState::Present, true);
     assert!(!shutdown.should_remove_for_shutdown(true));
 }
 
-fn assert_bus_update(state: &VfManagerState, present: bool, expected_action: Option<Vtl0Action>) {
-    assert_eq!(state.bus_update_action(present), expected_action);
+#[test]
+fn update_vtl0_bus() {
+    for vtl2 in VTL2_DEVICE_STATES {
+        for bus in VTL0_BUS_STATES {
+            for offered_to_guest in [false, true] {
+                let present = matches!(
+                    bus,
+                    Vtl0BusState::NotPresent | Vtl0BusState::HiddenNotPresent
+                );
+                let expected = match (bus, present, vtl2, offered_to_guest) {
+                    (Vtl0BusState::NotPresent, true, Vtl2DeviceState::Present, _) => {
+                        Some(Vtl0Action::NotifyArrival)
+                    }
+                    (Vtl0BusState::Present, false, _, true) => {
+                        Some(Vtl0Action::NotifyRemovalAndRevoke)
+                    }
+                    _ => None,
+                };
+                let state = state(false, vtl2, bus, offered_to_guest);
+                assert_eq!(state.bus_update_action(present), expected, "{state:?}");
+            }
+        }
+    }
 }
 
 #[test]
-fn update_visible_vtl0() {
-    let absent = state(
-        false,
-        Vtl2DeviceState::Present,
-        Vtl0BusState::NotPresent,
-        false,
-    );
-    assert_bus_update(&absent, true, Some(Vtl0Action::NotifyArrival));
-
-    let offered = state(
-        false,
-        Vtl2DeviceState::Present,
-        Vtl0BusState::Present(()),
-        true,
-    );
-    assert_bus_update(&offered, false, Some(Vtl0Action::NotifyRemovalAndRevoke));
-
-    let missing = state(
-        false,
-        Vtl2DeviceState::Missing,
-        Vtl0BusState::NotPresent,
-        false,
-    );
-    assert_bus_update(&missing, true, None);
-}
-
-#[test]
-fn hide_and_unhide_vtl0() {
-    let visible = state(
-        false,
-        Vtl2DeviceState::Present,
-        Vtl0BusState::Present(()),
-        true,
-    );
-    assert_eq!(
-        visible.hidden_change_action(true),
-        Some(Vtl0Action::NotifyRemovalAndRevoke)
-    );
-
-    let hidden_missing = state(
-        false,
-        Vtl2DeviceState::Missing,
-        Vtl0BusState::HiddenPresent(()),
-        false,
-    );
-    assert_eq!(hidden_missing.hidden_change_action(false), None);
-
-    let hidden_absent = state(
-        false,
-        Vtl2DeviceState::Present,
-        Vtl0BusState::HiddenNotPresent,
-        false,
-    );
-    assert_eq!(hidden_absent.hidden_change_action(false), None);
+fn change_vtl0_visibility() {
+    for vtl2 in VTL2_DEVICE_STATES {
+        for bus in VTL0_BUS_STATES {
+            for offered_to_guest in [false, true] {
+                for hidden in [false, true] {
+                    let expected = match (bus, hidden, vtl2, offered_to_guest) {
+                        (Vtl0BusState::Present, true, _, true) => {
+                            Some(Vtl0Action::NotifyRemovalAndRevoke)
+                        }
+                        (Vtl0BusState::HiddenPresent, false, Vtl2DeviceState::Present, _) => {
+                            Some(Vtl0Action::NotifyArrival)
+                        }
+                        _ => None,
+                    };
+                    let state = state(false, vtl2, bus, offered_to_guest);
+                    assert_eq!(state.hidden_change_action(hidden), expected, "{state:?}");
+                }
+            }
+        }
+    }
 }
