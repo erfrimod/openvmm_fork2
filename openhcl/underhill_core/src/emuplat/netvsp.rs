@@ -74,6 +74,82 @@ enum HclNetworkVfManagerMessage {
     SaveState(Rpc<(), VfManagerSaveResult>),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Vtl0State {
+    bus_present: bool,
+    bus_hidden: bool,
+    offered_to_guest: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VfManagerState {
+    shutdown_active: bool,
+    vtl0: Vtl0State,
+    vtl2: Vtl2DeviceState,
+}
+
+enum Vtl0Bus {
+    NotPresent,
+    Present(HclVpciBusControl),
+    HiddenNotPresent,
+    HiddenPresent(HclVpciBusControl),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Vtl0Action {
+    NotifyArrival,
+    NotifyRemovalAndRevoke,
+}
+
+impl VfManagerState {
+    fn should_add(&self) -> bool {
+        !self.shutdown_active
+            && matches!(self.vtl2, Vtl2DeviceState::Present)
+            && self.vtl0.bus_present
+            && !self.vtl0.bus_hidden
+            && !self.vtl0.offered_to_guest
+    }
+
+    fn should_remove(&self) -> bool {
+        !self.shutdown_active
+            && self.vtl0.bus_present
+            && !self.vtl0.bus_hidden
+            && self.vtl0.offered_to_guest
+    }
+
+    fn should_remove_for_shutdown(&self, remove_vtl0: bool) -> bool {
+        remove_vtl0 && self.should_remove()
+    }
+
+    fn bus_update_action(&self, present: bool) -> Option<Vtl0Action> {
+        assert_ne!(self.vtl0.bus_present, present);
+        if self.vtl0.bus_hidden {
+            None
+        } else if present {
+            matches!(self.vtl2, Vtl2DeviceState::Present).then_some(Vtl0Action::NotifyArrival)
+        } else {
+            self.vtl0
+                .offered_to_guest
+                .then_some(Vtl0Action::NotifyRemovalAndRevoke)
+        }
+    }
+
+    fn hidden_change_action(&self, hidden: bool) -> Option<Vtl0Action> {
+        if self.vtl0.bus_hidden == hidden {
+            return None;
+        }
+        if !self.vtl0.bus_present {
+            None
+        } else if hidden {
+            self.vtl0
+                .offered_to_guest
+                .then_some(Vtl0Action::NotifyRemovalAndRevoke)
+        } else {
+            matches!(self.vtl2, Vtl2DeviceState::Present).then_some(Vtl0Action::NotifyArrival)
+        }
+    }
+}
+
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum VfManagerSaveResult {
@@ -274,12 +350,6 @@ impl HclNetworkVFManagerGuestState {
     }
 }
 
-enum Vtl0Bus {
-    NotPresent,
-    Present(HclVpciBusControl),
-    HiddenNotPresent,
-    HiddenPresent(HclVpciBusControl),
-}
 impl std::fmt::Display for Vtl0Bus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -387,6 +457,24 @@ const RECONFIG_MAX_SLEEP: std::time::Duration = std::time::Duration::from_secs(2
 const RECONFIG_MAX_ATTEMPTS: u64 = 300; // ~10 minutes of retries at max backoff
 
 impl HclNetworkVFManagerWorker {
+    async fn vf_manager_state(&self, vtl2: Vtl2DeviceState) -> VfManagerState {
+        VfManagerState {
+            shutdown_active: self.is_shutdown_active,
+            vtl0: Vtl0State {
+                bus_present: matches!(
+                    self.vtl0_bus_control,
+                    Vtl0Bus::Present(_) | Vtl0Bus::HiddenPresent(_)
+                ),
+                bus_hidden: matches!(
+                    self.vtl0_bus_control,
+                    Vtl0Bus::HiddenNotPresent | Vtl0Bus::HiddenPresent(_)
+                ),
+                offered_to_guest: self.guest_state.is_offered_to_guest().await,
+            },
+            vtl2,
+        }
+    }
+
     pub fn new(
         mana_device: ManaDevice<VfioDevice>,
         save_state: RuntimeSavedState,
@@ -735,10 +823,10 @@ impl HclNetworkVFManagerWorker {
     ///
     /// Assumes the worker is not in shutdown.
     /// Visibility changes are applied immediately only when
-    /// `vtl2_device_present` is true. Otherwise, the new bus state is staged on
+    /// the VTL2 device is present. Otherwise, the new bus state is staged on
     /// `self` and will take effect when VTL2 comes back. On return,
     /// `save_state.hidden_vtl0` always reflects the requested visibility.
-    async fn hide_vtl0_vf(&mut self, rpc: Rpc<bool, ()>, vtl2_device_present: bool) {
+    async fn hide_vtl0_vf(&mut self, rpc: Rpc<bool, ()>, vf_manager_state: VfManagerState) {
         rpc.handle(async |hide_vtl0| {
             tracing::info!(
                 vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control),
@@ -747,40 +835,40 @@ impl HclNetworkVFManagerWorker {
                 "setting VTL0 VF hidden state"
             );
             *self.save_state.hidden_vtl0.lock() = Some(hide_vtl0);
+            let action = vf_manager_state.hidden_change_action(hide_vtl0);
             if hide_vtl0 {
                 if !matches!(self.vtl0_bus_control, Vtl0Bus::HiddenPresent(_)) {
                     let old_bus_control =
                         std::mem::replace(&mut self.vtl0_bus_control, Vtl0Bus::HiddenNotPresent);
                     if matches!(old_bus_control, Vtl0Bus::Present(_)) {
-                        *self.guest_state.vtl0_vfid.lock().await =
-                            vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
-                        self.try_notify_guest_and_revoke_vtl0_vf(
-                            &old_bus_control,
-                            vtl2_device_present,
-                        )
-                        .await;
+                        *self.guest_state.vtl0_vfid.lock().await = None;
+                        if matches!(action, Some(Vtl0Action::NotifyRemovalAndRevoke)) {
+                            self.try_notify_guest_and_revoke_vtl0_vf(
+                                &old_bus_control,
+                                matches!(vf_manager_state.vtl2, Vtl2DeviceState::Present),
+                            )
+                            .await;
+                        }
                         let Vtl0Bus::Present(bus_control) = old_bus_control else {
                             unreachable!();
                         };
                         self.vtl0_bus_control = Vtl0Bus::HiddenPresent(bus_control);
                     }
                 }
-            } else {
-                if matches!(self.vtl0_bus_control, Vtl0Bus::HiddenPresent(_)) {
-                    let Vtl0Bus::HiddenPresent(bus_control) =
-                        std::mem::replace(&mut self.vtl0_bus_control, Vtl0Bus::NotPresent)
-                    else {
-                        unreachable!();
-                    };
-                    self.vtl0_bus_control = Vtl0Bus::Present(bus_control);
-                    if vtl2_device_present {
-                        *self.guest_state.vtl0_vfid.lock().await =
-                            vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
-                        self.notify_vtl0_vf_arrival();
-                    }
-                } else if matches!(self.vtl0_bus_control, Vtl0Bus::HiddenNotPresent) {
-                    self.vtl0_bus_control = Vtl0Bus::NotPresent;
+            } else if matches!(self.vtl0_bus_control, Vtl0Bus::HiddenPresent(_)) {
+                let Vtl0Bus::HiddenPresent(bus_control) =
+                    std::mem::replace(&mut self.vtl0_bus_control, Vtl0Bus::NotPresent)
+                else {
+                    unreachable!();
+                };
+                self.vtl0_bus_control = Vtl0Bus::Present(bus_control);
+                if matches!(action, Some(Vtl0Action::NotifyArrival)) {
+                    *self.guest_state.vtl0_vfid.lock().await =
+                        vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
+                    self.notify_vtl0_vf_arrival();
                 }
+            } else if matches!(self.vtl0_bus_control, Vtl0Bus::HiddenNotPresent) {
+                self.vtl0_bus_control = Vtl0Bus::NotPresent;
             }
         })
         .await
@@ -833,28 +921,24 @@ impl HclNetworkVFManagerWorker {
     /// Updates which VTL0 VF, if any, is associated with this worker.
     ///
     /// Assumes the worker is not in shutdown.
-    /// When `vtl2_device_present` is true, the guest-visible VF id and
+    /// When the VTL2 device is present, the guest-visible VF id and
     /// arrival/removal notifications are updated immediately. Otherwise VTL0
     /// additions are staged until the VTL2 device starts again, while removals
     /// revoke the guest VF immediately.
     async fn update_vtl0_vf(
         &mut self,
         rpc: Rpc<Option<HclVpciBusControl>, ()>,
-        vtl2_device_present: bool,
+        vf_manager_state: VfManagerState,
     ) {
         rpc.handle(async |bus_control| {
-            let is_present = matches!(
-                self.vtl0_bus_control,
-                Vtl0Bus::Present(_) | Vtl0Bus::HiddenPresent(_)
-            );
-            assert!(is_present != bus_control.is_some());
-            let is_offered_to_guest = self.guest_state.is_offered_to_guest().await;
+            let action = vf_manager_state.bus_update_action(bus_control.is_some());
+            let vtl2_device_present = matches!(vf_manager_state.vtl2, Vtl2DeviceState::Present);
             tracing::info!(
                 vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control),
                 vtl0_bus = %self.vtl0_bus_control,
                 present = bus_control.is_some(),
                 vtl2_device_present,
-                is_offered_to_guest,
+                is_offered_to_guest = vf_manager_state.vtl0.offered_to_guest,
                 "VTL0 VF device change"
             );
             // The reaction to a VTL0 VF add/remove depends on both the current
@@ -878,16 +962,16 @@ impl HclNetworkVFManagerWorker {
                         vtl0_vfid_from_bus_control(&bus_control);
                     let old_bus_control =
                         std::mem::replace(&mut self.vtl0_bus_control, bus_control);
-                    match self.vtl0_bus_control {
-                        Vtl0Bus::Present(_) => self.notify_vtl0_vf_arrival(),
-                        Vtl0Bus::NotPresent => {
+                    match action {
+                        Some(Vtl0Action::NotifyArrival) => self.notify_vtl0_vf_arrival(),
+                        Some(Vtl0Action::NotifyRemovalAndRevoke) => {
                             self.try_notify_guest_and_revoke_vtl0_vf(
                                 &old_bus_control,
                                 vtl2_device_present,
                             )
                             .await
                         }
-                        _ => unreachable!(),
+                        None => {}
                     }
                 }
                 // When the VTL0 bus arrives, creating the VF will wait
@@ -899,14 +983,15 @@ impl HclNetworkVFManagerWorker {
                         .unwrap_or(Vtl0Bus::NotPresent);
                     let old_bus_control =
                         std::mem::replace(&mut self.vtl0_bus_control, bus_control);
-                    // Revoke the VTL0 VF on removal, even when the VTL2 device is not present.
                     if matches!(old_bus_control, Vtl0Bus::Present(_)) {
                         *self.guest_state.vtl0_vfid.lock().await = None;
-                        self.try_notify_guest_and_revoke_vtl0_vf(
-                            &old_bus_control,
-                            vtl2_device_present,
-                        )
-                        .await;
+                        if matches!(action, Some(Vtl0Action::NotifyRemovalAndRevoke)) {
+                            self.try_notify_guest_and_revoke_vtl0_vf(
+                                &old_bus_control,
+                                vtl2_device_present,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -1251,7 +1336,7 @@ impl HclNetworkVFManagerWorker {
     async fn process_vf_manager_message(
         &mut self,
         message: HclNetworkVfManagerMessage,
-        vtl2_device_present: bool,
+        vtl2_device_state: Vtl2DeviceState,
     ) -> WorkerControlFlow {
         let vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control);
         match message {
@@ -1270,43 +1355,44 @@ impl HclNetworkVFManagerWorker {
                     .await
             }
             HclNetworkVfManagerMessage::AddVtl0VF => {
-                if !self.is_shutdown_active {
-                    if vtl2_device_present {
-                        self.add_vtl0_vf()
-                            .instrument(tracing::info_span!("add vtl0 vf", vtl2_vfid))
-                            .await;
-                    } else {
-                        tracelimit::info_ratelimited!(
-                            vtl2_vfid,
-                            "VTL2 device not present; skipping VTL0 VF offer"
-                        );
-                    }
+                let state = self.vf_manager_state(vtl2_device_state).await;
+                if state.should_add() {
+                    self.add_vtl0_vf()
+                        .instrument(tracing::info_span!("add vtl0 vf", vtl2_vfid))
+                        .await;
+                } else {
+                    tracing::info!(?state, "ignoring request to add VTL0 VF");
                 }
             }
             HclNetworkVfManagerMessage::RemoveVtl0VF => {
-                if !self.is_shutdown_active {
-                    let vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
+                let vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
+                let state = self.vf_manager_state(vtl2_device_state).await;
+                if state.should_remove() {
                     self.remove_vtl0_vf()
                         .instrument(tracing::info_span!("remove vtl0 vf", vtl2_vfid, vtl0_vfid))
                         .await;
+                } else {
+                    tracing::info!(?state, "ignoring request to remove VTL0 VF");
                 }
             }
             HclNetworkVfManagerMessage::UpdateVtl0VF(rpc) => {
-                if self.is_shutdown_active {
+                let vf_manager_state = self.vf_manager_state(vtl2_device_state).await;
+                if vf_manager_state.shutdown_active {
                     rpc.complete(());
                 } else {
                     let vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
-                    self.update_vtl0_vf(rpc, vtl2_device_present)
+                    self.update_vtl0_vf(rpc, vf_manager_state)
                         .instrument(tracing::info_span!("update vtl0 vf", vtl2_vfid, vtl0_vfid))
                         .await;
                 }
             }
             HclNetworkVfManagerMessage::HideVtl0VF(rpc) => {
-                if self.is_shutdown_active {
+                let vf_manager_state = self.vf_manager_state(vtl2_device_state).await;
+                if vf_manager_state.shutdown_active {
                     rpc.complete(());
                 } else {
                     let vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control);
-                    self.hide_vtl0_vf(rpc, vtl2_device_present)
+                    self.hide_vtl0_vf(rpc, vf_manager_state)
                         .instrument(tracing::info_span!("hide vtl0 vf", vtl2_vfid, vtl0_vfid))
                         .await;
                 }
@@ -1325,7 +1411,10 @@ impl HclNetworkVFManagerWorker {
                     remove_vtl0_vf,
                     "beginning VTL2 device shutdown"
                 );
-                if remove_vtl0_vf {
+                let state = self.vf_manager_state(vtl2_device_state).await;
+                let should_remove = state.should_remove_for_shutdown(remove_vtl0_vf);
+                self.is_shutdown_active = true;
+                if should_remove {
                     self.remove_vtl0_vf()
                         .instrument(tracing::info_span!(
                             "remove vtl0 vf for shutdown",
@@ -1334,7 +1423,6 @@ impl HclNetworkVFManagerWorker {
                         ))
                         .await;
                 }
-                self.is_shutdown_active = true;
             }
             HclNetworkVfManagerMessage::ShutdownComplete(rpc) => {
                 tracing::info!(vtl2_vfid, "shutting down VTL2 device");
@@ -1487,9 +1575,8 @@ impl HclNetworkVFManagerWorker {
                     }
                 }
                 NextWorkItem::ManagerMessage(message) => {
-                    let vtl2_device_present = matches!(vtl2_device_state, Vtl2DeviceState::Present);
                     let control_flow = self
-                        .process_vf_manager_message(message, vtl2_device_present)
+                        .process_vf_manager_message(message, vtl2_device_state)
                         .await;
                     if matches!(control_flow, WorkerControlFlow::ExitWorker) {
                         return;
@@ -2251,3 +2338,6 @@ mod save_restore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
