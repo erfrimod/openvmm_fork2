@@ -1068,10 +1068,10 @@ impl LoadedVmNetworkSettings for UhVmNetworkSettings {
         Ok(())
     }
 
-    async fn unload_for_servicing(&mut self) {
+    async fn unload_for_servicing(&mut self, keep_vf_alive: bool) {
         let mut vf_managers: Vec<(Guid, Arc<HclNetworkVFManager>)> =
             self.vf_managers.drain().collect();
-        self.shutdown_vf_devices(&mut vf_managers, false, true)
+        self.shutdown_vf_devices(&mut vf_managers, false, keep_vf_alive)
             .await;
     }
 

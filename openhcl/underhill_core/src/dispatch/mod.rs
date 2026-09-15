@@ -126,7 +126,8 @@ pub trait LoadedVmNetworkSettings: Inspect {
     async fn remove_network(&mut self, instance_id: Guid) -> anyhow::Result<()>;
 
     /// Callback after stopping the VM and all workers, in preparation for a VTL2 reboot.
-    async fn unload_for_servicing(&mut self);
+    /// `keep_vf_alive` preserves the host VF across the reboot.
+    async fn unload_for_servicing(&mut self, keep_vf_alive: bool);
 
     /// Handles packet capture related operations.
     async fn packet_capture(
@@ -721,7 +722,7 @@ impl LoadedVm {
             let shutdown_mana = async {
                 if let Some(network_settings) = self.network_settings.as_mut() {
                     network_settings
-                        .unload_for_servicing()
+                        .unload_for_servicing(self.mana_keep_alive.is_enabled())
                         .instrument(
                             tracing::info_span!("shutdown_mana", CVM_ALLOWED, %correlation_id),
                         )
@@ -908,6 +909,18 @@ impl LoadedVm {
         // needed for a successful restore.
         let emuplat = (self.emuplat_servicing.save()).context("emuplat save failed")?;
 
+        // Must save the NIC state before calling `unload_for_servicing`, so
+        // that it is preserved for the restore.
+        let units = self.save_units().await.context("state unit save failed")?;
+
+        // Release MANA allocations before taking an NVMe-only DMA snapshot.
+        if nvme_keepalive_mode.is_enabled()
+            && !mana_keepalive_mode.is_enabled()
+            && let Some(network_settings) = &mut self.network_settings
+        {
+            network_settings.unload_for_servicing(false).await;
+        }
+
         // Only save dma manager state if we are expected to keep VF devices
         // alive across save. Otherwise, don't persist the state at all, as
         // there should be no live DMA across save.
@@ -940,7 +953,6 @@ impl LoadedVm {
             None
         };
 
-        let units = self.save_units().await.context("state unit save failed")?;
         let mana_state = if let Some(network_settings) = &mut self.network_settings
             && mana_keepalive_mode.is_enabled()
         {

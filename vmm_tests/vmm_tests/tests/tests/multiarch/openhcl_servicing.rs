@@ -1805,6 +1805,7 @@ async fn validate_mana_nic(agent: &PipetteClient) -> Result<(), anyhow::Error> {
 async fn mana_nic_servicing_core(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     igvm_file: ResolvedArtifact<LATEST_LINUX_DIRECT_TEST_X64>,
+    enable_mana_keepalive_at_boot: bool,
     enable_nvme_keepalive: bool,
     enable_mana_keepalive: bool,
 ) -> Result<(), anyhow::Error> {
@@ -1814,7 +1815,7 @@ async fn mana_nic_servicing_core(
 
     let (mut vm, agent) = config
         .with_vmbus_redirect(true)
-        .with_mana_keepalive(enable_mana_keepalive)
+        .with_mana_keepalive(enable_mana_keepalive_at_boot)
         .modify_backend(|b| b.with_nic())
         .run()
         .await?;
@@ -1833,35 +1834,67 @@ async fn mana_nic_servicing_core(
 }
 
 #[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
-async fn mana_nic_servicing(
+async fn mana_nic_servicing_all_disabled(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     (igvm_file,): (ResolvedArtifact<LATEST_LINUX_DIRECT_TEST_X64>,),
 ) -> Result<(), anyhow::Error> {
-    mana_nic_servicing_core(config, igvm_file, false, false).await
+    mana_nic_servicing_core(config, igvm_file, false, false, false).await
 }
 
 #[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
-async fn mana_nic_servicing_keepalive(
+async fn mana_nic_servicing_all_enabled(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     (igvm_file,): (ResolvedArtifact<LATEST_LINUX_DIRECT_TEST_X64>,),
 ) -> Result<(), anyhow::Error> {
-    mana_nic_servicing_core(config, igvm_file, true, true).await
+    mana_nic_servicing_core(config, igvm_file, true, true, true).await
 }
 
 #[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
-async fn mana_nic_servicing_only_mana_keepalive(
+async fn mana_nic_servicing_mana_keepalive_only(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     (igvm_file,): (ResolvedArtifact<LATEST_LINUX_DIRECT_TEST_X64>,),
 ) -> Result<(), anyhow::Error> {
-    mana_nic_servicing_core(config, igvm_file, false, true).await
+    mana_nic_servicing_core(config, igvm_file, true, false, true).await
 }
 
 #[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
-async fn mana_nic_servicing_only_nvme_keepalive(
+async fn mana_nic_servicing_nvme_keepalive_only(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     (igvm_file,): (ResolvedArtifact<LATEST_LINUX_DIRECT_TEST_X64>,),
 ) -> Result<(), anyhow::Error> {
-    mana_nic_servicing_core(config, igvm_file, true, false).await
+    mana_nic_servicing_core(config, igvm_file, false, true, false).await
+}
+
+#[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
+async fn mana_nic_servicing_boot_keepalive_only(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (igvm_file,): (ResolvedArtifact<LATEST_LINUX_DIRECT_TEST_X64>,),
+) -> Result<(), anyhow::Error> {
+    mana_nic_servicing_core(config, igvm_file, true, false, false).await
+}
+
+#[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
+async fn mana_nic_servicing_mana_keepalive_without_mana_boot_enablement(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (igvm_file,): (ResolvedArtifact<LATEST_LINUX_DIRECT_TEST_X64>,),
+) -> Result<(), anyhow::Error> {
+    mana_nic_servicing_core(config, igvm_file, false, false, true).await
+}
+
+#[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
+async fn mana_nic_servicing_nvme_keepalive_with_mana_boot_enablement(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (igvm_file,): (ResolvedArtifact<LATEST_LINUX_DIRECT_TEST_X64>,),
+) -> Result<(), anyhow::Error> {
+    mana_nic_servicing_core(config, igvm_file, true, true, false).await
+}
+
+#[openvmm_test(openhcl_linux_direct_x64 [LATEST_LINUX_DIRECT_TEST_X64])]
+async fn mana_nic_servicing_keepalive_without_mana_boot_enablement(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (igvm_file,): (ResolvedArtifact<LATEST_LINUX_DIRECT_TEST_X64>,),
+) -> Result<(), anyhow::Error> {
+    mana_nic_servicing_core(config, igvm_file, false, true, true).await
 }
 
 /// Test servicing an OpenHCL VM when NVME keepalive is enabled but then
