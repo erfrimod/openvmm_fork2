@@ -121,6 +121,131 @@ enum SmcError {
 
 pub use bnic::BnicConfig;
 
+/// Helpers for cross-crate testing.
+#[cfg(feature = "test_helpers")]
+pub mod test_helpers {
+    use super::GdmaDevice;
+    use super::VportConfig;
+    use super::queues;
+    use gdma_resources::VportDefinition;
+    use std::sync::Arc;
+    use thiserror::Error;
+    use vm_resource::ResourceResolver;
+
+    /// An error injecting an EQE into the hardware channel EQ.
+    #[derive(Debug, Error)]
+    pub enum InjectEqeError {
+        #[error("GDMA device has been dropped")]
+        DeviceDropped,
+        #[error("GDMA hardware channel EQ is unavailable")]
+        QueueNotFound(#[from] queues::QueueNotFound),
+    }
+
+    /// Resolves vport definitions for a test GDMA device.
+    pub async fn resolve_vports(
+        resolver: &ResourceResolver,
+        vports: Vec<VportDefinition>,
+    ) -> Result<Vec<VportConfig>, super::resolver::Error> {
+        super::resolver::resolve_vports(resolver, vports).await
+    }
+
+    /// Returns a function that injects EQEs into the hardware channel EQ.
+    pub fn hwc_eq_injector(
+        device: &GdmaDevice,
+    ) -> impl Fn(u8, &[u8]) -> Result<(), InjectEqeError> + Send + Sync + 'static {
+        let queues = Arc::downgrade(&device.queues);
+        move |ty, data| {
+            let queues = queues.upgrade().ok_or(InjectEqeError::DeviceDropped)?;
+            queues.try_post_eq(queues::ID_OFFSET as u32, ty, data)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::dma::DmaRegion;
+        use chipset_device::mmio::ExternallyManagedMmioIntercepts;
+        use gdma_defs::Eqe;
+        use gdma_defs::EqeDataReconfig;
+        use gdma_defs::GDMA_EQE_HWC_RECONFIG_DATA;
+        use gdma_defs::HWC_DATA_TYPE_HW_VPORT_LINK_CONNECT;
+        use gdma_defs::HWC_DATA_TYPE_HW_VPORT_LINK_DISCONNECT;
+        use gdma_defs::PAGE_SIZE64;
+        use guestmem::GuestMemory;
+        use net_backend::null::NullEndpoint;
+        use pal_async::DefaultDriver;
+        use pal_async::async_test;
+        use pci_core::msi::MsiConnection;
+        use test_with_tracing::test;
+        use vmcore::vm_task::SingleDriverBackend;
+        use vmcore::vm_task::VmTaskDriverSource;
+        use zerocopy::FromBytes;
+        use zerocopy::IntoBytes;
+
+        #[async_test]
+        async fn inject_eqe_lifecycle(driver: DefaultDriver) {
+            let memory = GuestMemory::allocate(PAGE_SIZE64 as usize);
+            let msi = MsiConnection::new();
+            let device = GdmaDevice::new(
+                &VmTaskDriverSource::new(SingleDriverBackend::new(driver)),
+                memory.clone(),
+                &msi.target(),
+                vec![VportConfig {
+                    mac_address: [1, 2, 3, 4, 5, 6].into(),
+                    endpoint: Box::new(NullEndpoint::new()),
+                }],
+                &mut ExternallyManagedMmioIntercepts,
+            );
+            let inject = hwc_eq_injector(&device);
+            assert!(matches!(
+                inject(GDMA_EQE_HWC_RECONFIG_DATA, &[]),
+                Err(InjectEqeError::QueueNotFound(_))
+            ));
+
+            let eq_id = device
+                .queues
+                .alloc_eq(DmaRegion::new(vec![0], 0, PAGE_SIZE64).unwrap(), 0)
+                .unwrap();
+            assert_eq!(eq_id, queues::ID_OFFSET as u32);
+
+            for (index, data_type) in [
+                HWC_DATA_TYPE_HW_VPORT_LINK_DISCONNECT,
+                HWC_DATA_TYPE_HW_VPORT_LINK_CONNECT,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let data = EqeDataReconfig {
+                    data: [0, 0, 0],
+                    data_type,
+                    reserved1: [0; 8],
+                };
+                inject(GDMA_EQE_HWC_RECONFIG_DATA, data.as_bytes()).unwrap();
+                let entry: Eqe = memory
+                    .read_plain((index * size_of::<Eqe>()) as u64)
+                    .unwrap();
+                assert_eq!(entry.params.event_type(), GDMA_EQE_HWC_RECONFIG_DATA);
+                let actual = EqeDataReconfig::read_from_prefix(&entry.data).unwrap().0;
+                assert_eq!(actual.data, data.data);
+                assert_eq!(actual.data_type, data.data_type);
+                assert_eq!(actual.reserved1, data.reserved1);
+            }
+
+            device.queues.free_eq(eq_id).unwrap();
+            assert!(matches!(
+                inject(GDMA_EQE_HWC_RECONFIG_DATA, &[]),
+                Err(InjectEqeError::QueueNotFound(_))
+            ));
+            drop(device);
+            assert!(matches!(
+                inject(GDMA_EQE_HWC_RECONFIG_DATA, &[]),
+                Err(InjectEqeError::DeviceDropped)
+            ));
+        }
+    }
+}
+
 pub struct VportConfig {
     pub mac_address: MacAddress,
     pub endpoint: Box<dyn Endpoint>,

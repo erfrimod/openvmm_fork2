@@ -6,6 +6,9 @@ name = "gdma"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+test_helpers = []
+
 [dependencies]
 gdma_defs.workspace = true
 gdma_resources.workspace = true
@@ -33,5 +36,10 @@ slab.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
+
+[dev-dependencies]
+pal_async.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

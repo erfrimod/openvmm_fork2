@@ -37,7 +37,7 @@ use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
 
 // Offset the queue IDs seen by the guest.
-const ID_OFFSET: usize = 24;
+pub(crate) const ID_OFFSET: usize = 24;
 
 struct CqEq<T> {
     region: DmaRegion,
@@ -478,21 +478,29 @@ impl Queues {
     }
 
     pub fn post_eq(&self, eq_id: u32, ty: u8, data: &[u8]) {
-        let post_msi = self.eq(eq_id).and_then(|mut eq| {
-            let mut eqe = Eqe {
-                data: FromZeros::new_zeroed(),
-                params: EqeParams::new()
-                    .with_event_type(ty)
-                    .with_owner_count(eq.q.owner_count()),
-            };
-            eqe.data[..data.len()].copy_from_slice(data);
-            eq.q.post(&self.gm, &eqe).then_some(eq.msix)
-        });
+        let _ = self.try_post_eq(eq_id, ty, data);
+    }
+
+    pub fn try_post_eq(&self, eq_id: u32, ty: u8, data: &[u8]) -> Result<(), QueueNotFound> {
+        let post_msi = self
+            .eq(eq_id)
+            .map(|mut eq| {
+                let mut eqe = Eqe {
+                    data: FromZeros::new_zeroed(),
+                    params: EqeParams::new()
+                        .with_event_type(ty)
+                        .with_owner_count(eq.q.owner_count()),
+                };
+                eqe.data[..data.len()].copy_from_slice(data);
+                eq.q.post(&self.gm, &eqe).then_some(eq.msix)
+            })
+            .ok_or(QueueNotFound(eq_id))?;
 
         if let Some(msix) = post_msi {
             tracing::trace!(eq_id, msix, "interrupt on eq post");
             self.msis[msix as usize].deliver();
         }
+        Ok(())
     }
 
     pub fn poll_sq(&self, sq_id: u32, cx: &mut Context<'_>) -> Poll<Wqe> {
