@@ -122,7 +122,7 @@ enum SmcError {
 pub use bnic::BnicConfig;
 
 /// Helpers for cross-crate testing.
-#[cfg(feature = "test_helpers")]
+#[cfg(any(feature = "test_helpers", test))]
 pub mod test_helpers {
     use super::GdmaDevice;
     use super::VportConfig;
