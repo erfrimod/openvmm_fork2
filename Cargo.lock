@@ -2911,6 +2911,7 @@ dependencies = [
  "gdma_resources",
  "pal_async",
  "pci_resources",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "vm_resource",
  "zerocopy",

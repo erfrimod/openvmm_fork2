@@ -116,3 +116,33 @@ impl AsyncResolveResource<PciDeviceHandleKind, GdmaTestDeviceHandle> for GdmaTes
         Ok(device.into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn encode_vport_link_state_request() {
+        for (connected, expected_data_type) in [
+            (false, HWC_DATA_TYPE_HW_VPORT_LINK_DISCONNECT),
+            (true, HWC_DATA_TYPE_HW_VPORT_LINK_CONNECT),
+        ] {
+            let data = encode_vport_link_state(0x00ab_cdef, connected).unwrap();
+            assert_eq!(data.data, [0xef, 0xcd, 0xab]);
+            assert_eq!(data.data_type, expected_data_type);
+            assert_eq!(data.reserved1, [0; 8]);
+        }
+    }
+
+    #[test]
+    fn validate_vport_link_state_boundary() {
+        let data = encode_vport_link_state(0x00ff_ffff, true).unwrap();
+        assert_eq!(data.data, [0xff; 3]);
+
+        assert!(matches!(
+            encode_vport_link_state(0x0100_0000, true),
+            Err(TestRequestError::VportTooLarge { vport: 0x0100_0000 })
+        ));
+    }
+}
