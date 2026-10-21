@@ -61,6 +61,7 @@ use net_backend::TxSegment;
 use net_backend::TxSegmentType;
 use net_backend::VlanMetadata;
 use pal_async::task::Spawn;
+use pal_async::task::Task;
 use safeatomic::AtomicSliceOps;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -104,6 +105,9 @@ pub struct ManaEndpoint<T: DeviceBacking> {
     arena: ResourceArena,
     receive_update: mesh::Receiver<bool>,
     queue_tracker: Arc<(AtomicUsize, SlimEvent)>,
+    /// Outstanding stats inspection tasks. Each holds a vport reference, so
+    /// `stop` must wait for them before the device can be torn down.
+    stats_tasks: Vec<Task<()>>,
     bounce_buffer: bool,
     #[cfg(test)]
     test_configuration: ManaTestConfiguration,
@@ -136,6 +140,7 @@ impl<T: DeviceBacking> ManaEndpoint<T> {
             arena: ResourceArena::new(),
             receive_update: endpoint_rx,
             queue_tracker: Arc::new((AtomicUsize::new(0), SlimEvent::new())),
+            stats_tasks: Vec::new(),
             bounce_buffer: match dma_mode {
                 GuestDmaMode::DirectDma => false,
                 GuestDmaMode::BounceBuffer => true,
@@ -283,16 +288,16 @@ impl<T: DeviceBacking> InspectMut for ManaEndpoint<T> {
             .sensitivity_child("stats", SensitivityLevel::Safe, |req| {
                 let vport = self.vport.clone();
                 let deferred = req.defer();
-                self.spawner
-                    .spawn("mana-stats", async move {
-                        let stats = if let Ok(stats) = vport.query_stats().await {
-                            stats
-                        } else {
-                            ManaQueryStatisticsResponse::new_zeroed()
-                        };
-                        deferred.inspect(inspect::adhoc(|req| inspect_mana_stats(&stats, req)));
-                    })
-                    .detach();
+                self.stats_tasks.retain(|task| !task.is_finished());
+                let task = self.spawner.spawn("mana-stats", async move {
+                    let stats = if let Ok(stats) = vport.query_stats().await {
+                        stats
+                    } else {
+                        ManaQueryStatisticsResponse::new_zeroed()
+                    };
+                    deferred.inspect(inspect::adhoc(|req| inspect_mana_stats(&stats, req)));
+                });
+                self.stats_tasks.push(task);
             });
     }
 }
@@ -525,6 +530,17 @@ impl<T: DeviceBacking> Endpoint for ManaEndpoint<T> {
                     vport_id = self.vport.id()
                 ))
                 .await;
+        }
+        // Wait rather than cancel so in-flight stats HWC commands can complete.
+        // Keep each handle in the vector until completion so cancelling stop
+        // does not cancel or lose track of the task.
+        while let Some(task) = self.stats_tasks.last_mut() {
+            task.instrument(tracing::info_span!(
+                "waiting for outstanding stats inspection",
+                vport_id = self.vport.id()
+            ))
+            .await;
+            self.stats_tasks.pop();
         }
     }
 

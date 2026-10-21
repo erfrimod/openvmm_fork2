@@ -8,6 +8,7 @@ use crate::ManaEndpoint;
 use crate::ManaTestConfiguration;
 use crate::QueueStats;
 use chipset_device::mmio::ExternallyManagedMmioIntercepts;
+use futures::FutureExt;
 use gdma::VportConfig;
 use gdma_defs::bnic::ManaQueryDeviceCfgResp;
 use inspect_counters::Counter;
@@ -24,8 +25,13 @@ use net_backend::VlanMetadata;
 use net_backend::loopback::LoopbackEndpoint;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
+use pal_async::task::Schedule;
+use pal_async::task::Spawn;
+use pal_async::task::TaskMetadata;
+use pal_async::task::task_queue;
 use pci_core::msi::MsiConnection;
 use std::future::poll_fn;
+use std::sync::Arc;
 use std::time::Duration;
 use test_with_tracing::test;
 use user_driver_emulated_mock::DeviceTestMemory;
@@ -1435,4 +1441,104 @@ async fn test_vlan_mixed_batch(driver: DefaultDriver) {
             .drop_eligible_indicator(),
         false
     );
+}
+
+struct HeldStatsSpawner(Arc<dyn Schedule>);
+
+impl Spawn for HeldStatsSpawner {
+    fn scheduler(&self, metadata: &TaskMetadata) -> Arc<dyn Schedule> {
+        assert_eq!(metadata.name().as_ref(), "mana-stats");
+        self.0.clone()
+    }
+}
+
+#[async_test]
+async fn test_endpoint_stop_drains_stats(driver: DefaultDriver) {
+    let source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let vm_driver = source.simple();
+    let mem = DeviceTestMemory::new(512, false, "stats lifetime");
+    let msi_conn = MsiConnection::new();
+    let device = gdma::GdmaDevice::new(
+        &source,
+        mem.guest_memory(),
+        &msi_conn.target(),
+        vec![VportConfig {
+            mac_address: [1, 2, 3, 4, 5, 6].into(),
+            endpoint: Box::new(LoopbackEndpoint::new()),
+        }],
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let device = EmulatedDevice::new(device, msi_conn, mem.dma_client());
+    let mut device = ManaDevice::new(&vm_driver, device, 1, 1, None).await.unwrap();
+    device.start_notification_task(&source).await;
+    let vport = device
+        .new_vport(0, None, device.dev_config())
+        .await
+        .unwrap();
+    let mut endpoint = ManaEndpoint::new(vm_driver, vport, GuestDmaMode::DirectDma).await;
+    let mut held_tasks = Vec::new();
+    let mut inspections = Vec::new();
+    for path in [
+        "stats/hc_in_octets",
+        "stats/hc_in_octets",
+        "stats/hc_out_octets",
+    ] {
+        let (tasks, scheduler) = task_queue("held mana stats");
+        endpoint.spawner = Box::new(HeldStatsSpawner(Arc::new(scheduler)));
+        inspections.push(inspect::inspect(path, &mut endpoint));
+        held_tasks.push(tasks);
+    }
+
+    // Stop should drain stats tasks with an abandoned inspection consumer.
+    drop(inspections.remove(0));
+    let mut abandoned_task = held_tasks.remove(0);
+    assert_eq!(endpoint.stats_tasks.len(), 3);
+
+    // The stats tasks cannot run yet, so stop must not complete. Cancelling it
+    // here also verifies that the outstanding tasks are retained, not dropped.
+    let result = CancelContext::new()
+        .with_timeout(Duration::from_millis(200))
+        .until_cancelled(endpoint.stop())
+        .await;
+    assert!(matches!(result, Err(CancelReason::DeadlineExceeded)));
+    // The endpoint should retain its tasks if stop is cancelled.
+    assert_eq!(endpoint.stats_tasks.len(), 3);
+
+    let _runners: Vec<_> = held_tasks
+        .into_iter()
+        .map(|mut tasks| driver.spawn("held mana stats runner", async move { tasks.run().await }))
+        .collect();
+
+    // Even after both observed inspections finish, stop must still wait for
+    // the task whose inspection consumer was dropped.
+    let result = CancelContext::new()
+        .with_timeout(Duration::from_millis(200))
+        .until_cancelled(endpoint.stop())
+        .await;
+    assert!(matches!(result, Err(CancelReason::DeadlineExceeded)));
+    assert_eq!(endpoint.stats_tasks.len(), 1);
+
+    let _abandoned_runner = driver.spawn("abandoned mana stats runner", async move {
+        abandoned_task.run().await
+    });
+    endpoint.stop().await;
+    assert!(endpoint.stats_tasks.is_empty());
+
+    for mut inspection in inspections {
+        inspection
+            .resolve()
+            .now_or_never()
+            .expect("stats response must be available when stop returns");
+        let inspect::Node::Value(value) = inspection.results() else {
+            panic!("stats task must finish, not be cancelled");
+        };
+        assert_eq!(value.kind, inspect::ValueKind::Unsigned(0));
+    }
+    assert_eq!(Arc::strong_count(&endpoint.vport), 1);
+
+    drop(endpoint);
+    // The emulator rejects stats queries, which records an HWC failure. The
+    // important part is that shutdown returns rather than panicking.
+    let (result, _backing) = device.shutdown().await;
+    assert_eq!(result.unwrap_err().to_string(), "Previous hardware failure");
 }

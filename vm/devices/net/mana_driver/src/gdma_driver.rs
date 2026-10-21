@@ -969,6 +969,12 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             Ok(resp) => resp,
             Err(err) => {
                 self.hwc_failure = true;
+                tracing::error!(
+                    request = format_args!("{:#x}", req_msg_type),
+                    hwc_activity_id = format_args!("{:#x}", hdr.activity_id),
+                    error = err.as_ref() as &dyn std::error::Error,
+                    "MANA HWC request failed"
+                );
                 return Err(err);
             }
         };
@@ -1151,6 +1157,7 @@ impl<T: DeviceBacking> GdmaDriver<T> {
             || interrupt_loss
         {
             tracing::warn!(
+                hwc_activity_id = format_args!("{:#x}", self.hwc_activity_id),
                 wait_failed,
                 wait_ms = eqe_wait_result.elapsed,
                 int_loss = interrupt_loss,
