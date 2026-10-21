@@ -1517,6 +1517,12 @@ impl<T: RingMem> ProcessLoop<T> {
         vtl2_settings_buf: Vec<u8>,
         kind: get_protocol::GuestNotifications,
     ) -> Result<(), FatalError> {
+        tracelimit::info_ratelimited!(
+            CVM_ALLOWED,
+            ?kind,
+            payload_size = vtl2_settings_buf.len(),
+            "sending ModifyVtl2Settings notification"
+        );
         let res = self
             .guest_notification_listeners
             .vtl2_settings
@@ -2079,4 +2085,55 @@ fn prepare_igvm_attest_request(
         report_max,
         report.len() as u32,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProcessLoop;
+    use get_protocol::GuestNotifications;
+    use get_protocol::HeaderGeneric;
+    use get_protocol::LargePayloadState;
+    use test_with_tracing::test;
+    use zerocopy::IntoBytes;
+
+    #[test]
+    fn test_modify_vtl2_settings_rev1_notification() {
+        let (_host, guest) = vmbus_async::pipe::connected_message_pipes(
+            get_protocol::MAX_MESSAGE_SIZE + vmbus_ring::PAGE_SIZE,
+        );
+        let mut process_loop = ProcessLoop::new(guest);
+        let (mut requests, buffered) = process_loop
+            .guest_notification_listeners
+            .vtl2_settings
+            .init_receiver()
+            .unwrap();
+        assert_eq!(buffered, 0);
+
+        let mut fragment = get_protocol::ModifyVtl2SettingsRev1Notification {
+            message_header: HeaderGeneric::new(GuestNotifications::MODIFY_VTL2_SETTINGS_REV1),
+            size: 1,
+            payload_state: LargePayloadState::MORE,
+        };
+        process_loop
+            .handle_modify_vtl2_settings_rev1_notification(&[fragment.as_bytes(), b"["].concat())
+            .unwrap();
+        assert!(matches!(
+            requests.try_recv(),
+            Err(mesh::TryRecvError::Empty)
+        ));
+
+        fragment.payload_state = LargePayloadState::END;
+        process_loop
+            .handle_modify_vtl2_settings_rev1_notification(&[fragment.as_bytes(), b"]"].concat())
+            .unwrap();
+        requests.try_recv().unwrap().0.handle_sync(|payload| {
+            assert_eq!(payload, b"[]");
+            Ok(())
+        });
+        assert!(process_loop.vtl2_settings_buf.is_none());
+        assert!(matches!(
+            requests.try_recv(),
+            Err(mesh::TryRecvError::Empty)
+        ));
+    }
 }
